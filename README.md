@@ -121,7 +121,6 @@ this fork.
 ```bash
 git clone https://github.com/ashe-wb/moespressoV3-m1-fork
 cd moespressoV3-m1-fork
-git switch qwen4-speed
 uv sync --locked
 ```
 
