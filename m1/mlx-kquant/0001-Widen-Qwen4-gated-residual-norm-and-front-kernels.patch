@@ -1,0 +1,280 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashe-wb <7331481+ashe-wb@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 16:33:33 +0000
+Subject: [PATCH] Widen Qwen4 gated-residual norm and front kernels
+
+Split the residual norm into one threadgroup per branch and compute one low-rank or injection row per simdgroup. Per-row and per-branch accumulation order is unchanged, so outputs are bitwise identical. The GDN pre-router measured 0.468 -> 0.384 ms per call on a 32 GB M1 Max.
+---
+ metal/mlx/backend/metal/kernels/kq_qwen4_hc.h | 152 ++++++++++++++++++
+ src/kquant_qwen4_gdn_prerouter.cpp            |  17 +-
+ src/kquant_qwen4_hc.cpp                       |  11 +-
+ 3 files changed, 170 insertions(+), 10 deletions(-)
+
+diff --git a/metal/mlx/backend/metal/kernels/kq_qwen4_hc.h b/metal/mlx/backend/metal/kernels/kq_qwen4_hc.h
+index 0381043..3962491 100644
+--- a/metal/mlx/backend/metal/kernels/kq_qwen4_hc.h
++++ b/metal/mlx/backend/metal/kernels/kq_qwen4_hc.h
+@@ -314,3 +314,155 @@ METAL_FUNC bfloat16_t kq_qwen4_hc_sigmoid(bfloat16_t x) {
+     mixed[d_out] = bfloat16_t(float(as_type<bfloat16_t>(total_bits)) * 0.25f);
+   }
+ }
++
++// One threadgroup per residual branch. Each branch keeps the per-thread,
++// per-simdgroup and cross-simdgroup summation order of kq_qwen4_hc_norm, so the
++// outputs are bitwise identical while the four reductions run on four cores.
++[[kernel]] void kq_qwen4_hc_norm_split(
++    const device bfloat16_t* residual [[buffer(0)]],
++    const device bfloat16_t* norm_weight [[buffer(1)]],
++    const device bfloat16_t* pending_output [[buffer(2)]],
++    const device bfloat16_t* pending_injection [[buffer(3)]],
++    device bfloat16_t* normalized [[buffer(4)]],
++    device bfloat16_t* updated_residual [[buffer(5)]],
++    const constant float& eps [[buffer(6)]],
++    const constant int& has_pending [[buffer(7)]],
++    uint3 tg [[threadgroup_position_in_grid]],
++    uint tid [[thread_index_in_threadgroup]],
++    uint lane [[thread_index_in_simdgroup]],
++    uint sg [[simdgroup_index_in_threadgroup]]) {
++  constexpr int width = 2560;
++  constexpr int values_per_thread = 4;
++  constexpr int threads_per_group = width / values_per_thread;
++  constexpr int simdgroups_per_group = threads_per_group / SIMD_SIZE;
++  threadgroup float partials[simdgroups_per_group];
++  threadgroup float inv_rms;
++  const int stream = int(tg.x);
++  const int base = stream * width;
++  const int first = int(tid) * values_per_thread;
++  float sum_squares = 0.0f;
++  bfloat16_t kept[values_per_thread];
++#pragma unroll
++  for (int i = 0; i < values_per_thread; ++i) {
++    const int d = first + i;
++    bfloat16_t value = residual[base + d];
++    if (has_pending != 0) {
++      const bfloat16_t update = bfloat16_t(
++          float(pending_output[d]) * float(pending_injection[stream]));
++      value = bfloat16_t(float(value) + float(update));
++    }
++    updated_residual[base + d] = value;
++    kept[i] = value;
++    const float source = float(value);
++    volatile float square = source * source;
++    sum_squares += square;
++  }
++  sum_squares = simd_sum(sum_squares);
++  if (lane == 0) {
++    partials[sg] = sum_squares;
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  if (sg == 0) {
++    const float cross_simd =
++        simd_sum(lane < simdgroups_per_group ? partials[lane] : 0.0f);
++    if (lane == 0) {
++      volatile float mean_square = cross_simd * (1.0f / float(width));
++      volatile float stabilized_mean = mean_square + eps;
++      inv_rms = metal::precise::rsqrt(stabilized_mean);
++    }
++  }
++  threadgroup_barrier(mem_flags::mem_threadgroup);
++  const float inv = inv_rms;
++#pragma unroll
++  for (int i = 0; i < values_per_thread; ++i) {
++    const int index = base + first + i;
++    const float unit = float(kept[i]) * inv;
++    const float scale = 1.0f + float(norm_weight[index]);
++    normalized[index] = bfloat16_t(unit * scale);
++  }
++}
++
++// kq_qwen4_hc_front with one output row per simdgroup. Rows use the same lane
++// partitioning and accumulation order, so each row is bitwise identical.
++// Grid: 160 down threadgroups (2 rows each) plus 2 injection threadgroups.
++[[kernel]] void kq_qwen4_hc_front_r1(
++    const device bfloat16_t* normalized [[buffer(0)]],
++    const device uint8_t* down_weight [[buffer(1)]],
++    const device uint8_t* injection_weight [[buffer(2)]],
++    device bfloat16_t* lowrank [[buffer(3)]],
++    device bfloat16_t* injection [[buffer(4)]],
++    const constant int& has_injection [[buffer(5)]],
++    uint3 tg [[threadgroup_position_in_grid]],
++    uint sg [[simdgroup_index_in_threadgroup]],
++    uint lane [[thread_index_in_simdgroup]]) {
++  constexpr int expanded = 10240;
++  constexpr int lowrank_width = 320;
++  constexpr int down_groups = lowrank_width / 2;
++  constexpr int q6_row_bytes =
++      expanded * KQ_Q6_K_BLOCK_BYTES / KQ_Q6_K_SUPERBLOCK;
++  constexpr int q6_blocks = expanded / KQ_Q6_K_SUPERBLOCK;
++  constexpr int superblock_stride = 2;
++
++  const bool is_down = int(tg.x) < down_groups;
++  if (!is_down && has_injection == 0) {
++    return;
++  }
++  const int row_index = is_down ? int(tg.x) * 2 + int(sg)
++                                : (int(tg.x) - down_groups) * 2 + int(sg);
++  const device uint8_t* weight = is_down ? down_weight : injection_weight;
++
++  const int tid_lane = int(lane) / 2;
++  const int ix = int(lane) % 2;
++  const int ip = tid_lane / 8;
++  const int il = tid_lane % 8;
++  const int l0 = 4 * il;
++  const int is = 8 * ip + l0 / 16;
++  float values[16];
++  float result = 0.0f;
++  for (int ib = ix; ib < q6_blocks; ib += superblock_stride) {
++    const int x_base = ib * KQ_Q6_K_SUPERBLOCK + 128 * ip + l0;
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++      values[4 * l + 0] = float(normalized[x_base + l + 0]);
++      values[4 * l + 1] = float(normalized[x_base + l + 32]);
++      values[4 * l + 2] = float(normalized[x_base + l + 64]);
++      values[4 * l + 3] = float(normalized[x_base + l + 96]);
++    }
++    const device uint8_t* block =
++        weight + int64_t(row_index) * q6_row_bytes + ib * KQ_Q6_K_BLOCK_BYTES;
++    const device uint8_t* q1 = kq_q6_k_ql_ptr(block) + 64 * ip + l0;
++    const device uint8_t* q2 = q1 + 32;
++    const device uint8_t* qh = kq_q6_k_qh_ptr(block) + 32 * ip + l0;
++    const device int8_t* scales = kq_q6_k_scales_ptr(block) + is;
++    float sums[4] = {0.0f, 0.0f, 0.0f, 0.0f};
++#pragma unroll
++    for (int l = 0; l < 4; ++l) {
++      const uint8_t q1l = q1[l];
++      const uint8_t q2l = q2[l];
++      const uint8_t qhl = qh[l];
++      const int8_t v0 = int8_t((q1l & 0x0f) | ((qhl & 0x03) << 4)) - int8_t(32);
++      const int8_t v1 = int8_t((q2l & 0x0f) | ((qhl & 0x0c) << 2)) - int8_t(32);
++      const int8_t v2 = int8_t((q1l >> 4) | ((qhl & 0x30) << 0)) - int8_t(32);
++      const int8_t v3 = int8_t((q2l >> 4) | ((qhl & 0xc0) >> 2)) - int8_t(32);
++      sums[0] += values[4 * l + 0] * float(v0);
++      sums[1] += values[4 * l + 1] * float(v1);
++      sums[2] += values[4 * l + 2] * float(v2);
++      sums[3] += values[4 * l + 3] * float(v3);
++    }
++    const float d = float(kq_q6_k_d(block));
++    result += d *
++        (sums[0] * float(scales[0]) + sums[1] * float(scales[2]) +
++         sums[2] * float(scales[4]) + sums[3] * float(scales[6]));
++  }
++  const float reduced = simd_sum(result);
++  if (lane == 0) {
++    const bfloat16_t projected = bfloat16_t(reduced);
++    const bfloat16_t scaled = bfloat16_t(float(projected) * 0.25f);
++    const bfloat16_t gate = kq_qwen4_hc_sigmoid(scaled);
++    if (is_down) {
++      lowrank[row_index] = bfloat16_t(float(scaled) * float(gate));
++    } else {
++      injection[row_index] = bfloat16_t(2.0f * float(gate));
++    }
++  }
++}
+diff --git a/src/kquant_qwen4_gdn_prerouter.cpp b/src/kquant_qwen4_gdn_prerouter.cpp
+index f398953..a31b707 100644
+--- a/src/kquant_qwen4_gdn_prerouter.cpp
++++ b/src/kquant_qwen4_gdn_prerouter.cpp
+@@ -11,6 +11,7 @@
+ #include "mlx/utils.h"
+ 
+ #ifdef _METAL_
++
+ #include "kquant_metal_internal.h"
+ #include "mlx/backend/metal/device.h"
+ #endif
+@@ -244,7 +245,9 @@ void KQuantQwen4GDNPreRouterQ6::eval_gpu(
+ 
+   // Attention gated-residual read, optionally folding the preceding layer's
+   // pending block output and injection pair.
+-  auto hc_norm = kq_get_kernel(device, "kq_qwen4_hc_norm");
++  auto hc_norm = kq_get_kernel(device, "kq_qwen4_hc_norm_split");
++  // One threadgroup per residual branch.
++  const MTL::Size norm_grid(4, 1, 1);
+   encoder.set_compute_pipeline_state(hc_norm);
+   encoder.set_input_array(inputs[0], 0);
+   encoder.set_input_array(inputs[1], 1);
+@@ -255,10 +258,12 @@ void KQuantQwen4GDNPreRouterQ6::eval_gpu(
+   encoder.set_bytes(eps_, 6);
+   int has_pending = has_pending_ ? 1 : 0;
+   encoder.set_bytes(has_pending, 7);
+-  encoder.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(640, 1, 1));
++  encoder.dispatch_threadgroups(norm_grid, MTL::Size(640, 1, 1));
+ 
+   // Attention low-rank front and four-element injection gate.
+-  auto hc_front = kq_get_kernel(device, "kq_qwen4_hc_front");
++  auto hc_front = kq_get_kernel(device, "kq_qwen4_hc_front_r1");
++  // 160 two-row down threadgroups plus two injection threadgroups.
++  const MTL::Size front_grid(162, 1, 1);
+   encoder.set_compute_pipeline_state(hc_front);
+   encoder.set_input_array(attention_normalized, 0);
+   encoder.set_input_array(inputs[2], 1);
+@@ -267,7 +272,7 @@ void KQuantQwen4GDNPreRouterQ6::eval_gpu(
+   encoder.set_output_array(attention_injection, 4);
+   int has_injection = 1;
+   encoder.set_bytes(has_injection, 5);
+-  encoder.dispatch_threadgroups(MTL::Size(41, 1, 1), MTL::Size(32, 2, 1));
++  encoder.dispatch_threadgroups(front_grid, MTL::Size(32, 2, 1));
+ 
+   // Attention hC epilogue produces the hidden row consumed by GDN.
+   auto hc_epilogue = kq_get_kernel(device, "kq_qwen4_hc_epilogue");
+@@ -385,7 +390,7 @@ void KQuantQwen4GDNPreRouterQ6::eval_gpu(
+   encoder.set_bytes(eps_, 6);
+   has_pending = 1;
+   encoder.set_bytes(has_pending, 7);
+-  encoder.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(640, 1, 1));
++  encoder.dispatch_threadgroups(norm_grid, MTL::Size(640, 1, 1));
+ 
+   // MLP gated-residual front and epilogue stay outside the router boundary;
+   // their hidden row and injection are returned for the caller's router/MLP.
+@@ -397,7 +402,7 @@ void KQuantQwen4GDNPreRouterQ6::eval_gpu(
+   encoder.set_output_array(outputs[2], 4);
+   has_injection = 1;
+   encoder.set_bytes(has_injection, 5);
+-  encoder.dispatch_threadgroups(MTL::Size(41, 1, 1), MTL::Size(32, 2, 1));
++  encoder.dispatch_threadgroups(front_grid, MTL::Size(32, 2, 1));
+ 
+   encoder.set_compute_pipeline_state(hc_epilogue);
+   encoder.set_input_array(mlp_lowrank, 0);
+diff --git a/src/kquant_qwen4_hc.cpp b/src/kquant_qwen4_hc.cpp
+index eedd819..bb0bafc 100644
+--- a/src/kquant_qwen4_hc.cpp
++++ b/src/kquant_qwen4_hc.cpp
+@@ -135,7 +135,7 @@ void KQuantQwen4HCNorm::eval_gpu(
+     output.set_data(mx::allocator::malloc(output.nbytes()));
+   }
+ 
+-  auto kernel = kq_get_kernel(device, "kq_qwen4_hc_norm");
++  auto kernel = kq_get_kernel(device, "kq_qwen4_hc_norm_split");
+   auto& encoder = mx::metal::get_command_encoder(stream);
+   encoder.set_compute_pipeline_state(kernel);
+   encoder.set_input_array(inputs[0], 0);
+@@ -147,7 +147,8 @@ void KQuantQwen4HCNorm::eval_gpu(
+   encoder.set_bytes(eps_, 6);
+   int has_pending = has_pending_ ? 1 : 0;
+   encoder.set_bytes(has_pending, 7);
+-  encoder.dispatch_threadgroups(MTL::Size(1, 1, 1), MTL::Size(640, 1, 1));
++  encoder.dispatch_threadgroups(
++      MTL::Size(4, 1, 1), MTL::Size(640, 1, 1));
+ }
+ 
+ void KQuantQwen4HCFront::eval_gpu(
+@@ -159,7 +160,7 @@ void KQuantQwen4HCFront::eval_gpu(
+     output.set_data(mx::allocator::malloc(output.nbytes()));
+   }
+ 
+-  auto kernel = kq_get_kernel(device, "kq_qwen4_hc_front");
++  auto kernel = kq_get_kernel(device, "kq_qwen4_hc_front_r1");
+   auto& encoder = mx::metal::get_command_encoder(stream);
+   encoder.set_compute_pipeline_state(kernel);
+   encoder.set_input_array(inputs[0], 0);
+@@ -170,7 +171,9 @@ void KQuantQwen4HCFront::eval_gpu(
+   int has_injection = has_injection_ ? 1 : 0;
+   encoder.set_bytes(has_injection, 5);
+   encoder.dispatch_threadgroups(
+-      MTL::Size(has_injection_ ? 41 : 40, 1, 1), MTL::Size(32, 2, 1));
++      MTL::Size(
++          has_injection_ ? 162 : 160, 1, 1),
++      MTL::Size(32, 2, 1));
+ }
+ 
+ void KQuantQwen4HCEpilogue::eval_gpu(

@@ -131,8 +131,7 @@ the original top routes, and at token boundaries the host loads the strongest
 missing originals in the background, up to `MOESPRESSO_QWEN4_AUTONOMOUS_ADMIT`
 routes per token (default 4). On a 32 GB M1 Max at a 24 GB budget, decode rose
 from 17.1 tokens/s with the default Cache-Prior 2/2 routing to 25.0 tokens/s,
-with an mlx-kquant kernel change and a capacity profile that the repository
-does not include.
+with the mlx-kquant kernel patch and capacity profile in `m1/`.
 Teacher-forced on exact-routing greedy references, NLL was 1.1618 for exact
 routing, 1.1762 for Cache-Prior 2/2 and 1.2057 for autonomous decode, with top-1
 agreement of 0.795, 0.769 and 0.761. Run it with `MLX_MAX_OPS_PER_BUFFER=100`.

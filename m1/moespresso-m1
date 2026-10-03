@@ -1,0 +1,59 @@
+#!/bin/zsh
+# Run MoEspresso with the configuration behind this fork's measured results:
+# the patched mlx-kquant build, the per-layer capacity profile, an MLX
+# buffer-cache cap and GPU-autonomous decode.
+#
+# Usage: m1/moespresso-m1 generate|serve ...    same arguments as `moespresso`
+#        m1/moespresso-m1 run SCRIPT [ARGS...]  run a Python script, such as m1/bench/*.py
+#
+# Build the kernels first with m1/build-mlx-kquant.sh. Every setting below can
+# be overridden from the environment.
+set -eu
+HERE=${0:A:h}
+REPO=${HERE:h}
+KQUANT=${MOESPRESSO_M1_KQUANT:-$HERE/build/mlx-kquant}
+for f in mlx_kquant/libmlx_kquant_ext.dylib mlx_kquant/mlx_kquant.metallib; do
+  [[ -f $KQUANT/$f ]] || {
+    echo "moespresso-m1: $KQUANT/$f is missing; run m1/build-mlx-kquant.sh first" >&2
+    exit 1
+  }
+done
+
+# The patched mlx-kquant shadows the pinned one. The shim caps MLX's freed-buffer
+# cache, which --max-memory-gb does not count. Left unbounded, it grew during a
+# long agent session until macOS compressed the expert pools and decode slowed.
+export PYTHONPATH="$KQUANT:$HERE/mlx_cache_limit${PYTHONPATH:+:$PYTHONPATH}"
+export MLX_CACHE_LIMIT_GB=${MLX_CACHE_LIMIT_GB:-1}
+export MOESPRESSO_QWEN4_CAPACITY_PROFILE=${MOESPRESSO_QWEN4_CAPACITY_PROFILE:-$HERE/qwen4-capacity-profile.json}
+
+# GPU-autonomous decode is on by default. MOESPRESSO_QWEN4_AUTONOMOUS=0 restores
+# Cache-Prior 2/2 routing.
+export MOESPRESSO_QWEN4_AUTONOMOUS=${MOESPRESSO_QWEN4_AUTONOMOUS:-1}
+if [[ $MOESPRESSO_QWEN4_AUTONOMOUS == 1 ]]; then
+  # Without per-layer host gates, larger command buffers and a two-layer submit
+  # interval measured fastest.
+  export MLX_MAX_OPS_PER_BUFFER=${MLX_MAX_OPS_PER_BUFFER:-100}
+  export MLX_MAX_MB_PER_BUFFER=${MLX_MAX_MB_PER_BUFFER:-200}
+  export MOESPRESSO_QWEN4_AUTONOMOUS_KICK=${MOESPRESSO_QWEN4_AUTONOMOUS_KICK:-2}
+  # Follow-up chunks of at most 128 tokens after a cached prefix use Cache-Prior
+  # 2/2 routing during prefill.
+  export MOESPRESSO_QWEN4_PREFILL_CACHE_ROUTING=${MOESPRESSO_QWEN4_PREFILL_CACHE_ROUTING:-1}
+fi
+
+# Two Qwen3.8-Flash-Next servers cannot share 32 GB. Refuse with a clear message
+# instead of a negative-memory planner failure.
+if [[ ${1:-} == serve && ${MOESPRESSO_ALLOW_SECOND_SERVER:-0} != 1 ]]; then
+  other=$(pgrep -fl "moespresso.runtime.http" || true)
+  if [[ -n $other ]]; then
+    echo "moespresso-m1: another MoEspresso server already holds the model's memory:" >&2
+    echo "$other" >&2
+    echo "Stop it first, or set MOESPRESSO_ALLOW_SECOND_SERVER=1." >&2
+    exit 1
+  fi
+fi
+
+if [[ ${1:-} == run ]]; then
+  shift
+  exec uv run --locked --project "$REPO" python "$@"
+fi
+exec uv run --locked --project "$REPO" moespresso "$@"
