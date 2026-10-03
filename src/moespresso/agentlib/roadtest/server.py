@@ -247,6 +247,17 @@ class ServerController:
                 break
             except subprocess.TimeoutExpired:
                 continue
+        # The launcher can exit before the serve worker it started. A restart
+        # that begins while the old worker still holds its expert pools makes
+        # the next startup plan against memory that is about to be released.
+        if pgid is not None:
+            deadline = time.monotonic() + 60.0
+            while time.monotonic() < deadline:
+                try:
+                    os.killpg(pgid, 0)
+                except ProcessLookupError:
+                    break
+                time.sleep(0.2)
         if self._log_handle is not None:
             self._log_handle.close()
             self._log_handle = None

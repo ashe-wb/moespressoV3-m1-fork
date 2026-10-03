@@ -260,3 +260,60 @@ def _capture(errors: list[BaseException], call) -> None:
         call()
     except BaseException as exc:
         errors.append(exc)
+
+
+def test_deferred_token_drain_joins_only_the_oldest_token() -> None:
+    session = PooledDecodeSession()
+    gate = _Gate()
+    release_second = threading.Event()
+    finished: list[str] = []
+
+    def writer(name: str, wait: threading.Event | None = None):
+        def call(cancelled) -> None:
+            if wait is not None:
+                assert wait.wait(5)
+            finished.append(name)
+        return call
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with session.request(object(), synchronize=lambda root: None):
+            with session.deferred_token_drain():
+                assert session.defers_token_drain
+                session.next_sequence(gate)
+                session.submit(executor, writer("first-a"))
+                session.submit(executor, writer("first-b"))
+                session.mark_token_boundary()
+                session.submit(executor, writer("second", release_second))
+                session.mark_token_boundary()
+            assert not session.defers_token_drain
+
+            session.drain_token()
+            assert finished == ["first-a", "first-b"]
+            assert session.pending
+            release_second.set()
+            session.drain_token()
+            assert finished == ["first-a", "first-b", "second"]
+            with pytest.raises(RuntimeError, match="no deferred token"):
+                session.drain_token()
+
+
+def test_deferred_token_drain_surfaces_worker_failure_before_commit() -> None:
+    session = PooledDecodeSession()
+    gate = _Gate()
+    error = OSError("writer failed")
+
+    def fail(cancelled) -> None:
+        raise error
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        with pytest.raises(OSError) as raised:
+            with session.request(object(), synchronize=lambda root: None):
+                with session.deferred_token_drain():
+                    session.next_sequence(gate)
+                    session.submit(executor, fail)
+                    session.mark_token_boundary()
+                session.drain_token()
+                pytest.fail("a failed deferred token must not reach commit")
+
+    assert raised.value is error
+    assert not session.active

@@ -157,23 +157,75 @@ def qwen4_gdn_prerouter_step(
     if not certified_all_valid:
         _GDN_PREROUTER_CALL_COUNTS["fallback_mask"] += 1
         return None
-    if state is None or not _qwen4_gdn_prerouter_contract(layer, state):
+    static = _certified_prerouter_arguments(layer, state)
+    if static is None:
         _GDN_PREROUTER_CALL_COUNTS["fallback_contract"] += 1
+        return None
+    operation, before_state, between_states, after_state, eps = static
+    outputs = operation(
+        hidden_states,
+        *before_state,
+        state.conv_state,
+        *between_states,
+        state.recurrent_state,
+        *after_state,
+        pending_output,
+        pending_injection,
+        eps=eps,
+    )
+    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
+        raise RuntimeError("native Qwen GDN pre-router returned an invalid result")
+    mlp_hidden, residual, injection, conv_state, recurrent_state = outputs
+    next_state = Qwen4GDNState(
+        conv_state=conv_state,
+        recurrent_state=recurrent_state,
+        offset=state.offset + 1,
+    )
+    _GDN_PREROUTER_CALL_COUNTS["native_calls"] += 1
+    return Qwen4GDNPreRouterResult(
+        mlp_hidden=mlp_hidden,
+        residual=residual,
+        injection=injection,
+        state=next_state,
+        frontier=next_state.offset,
+    )
+
+
+def _certified_prerouter_arguments(layer: Any, state: Any):
+    """Return the layer's certified native operation and weight arguments.
+
+    Layer weights and geometry are fixed after loading, so the full contract is
+    checked once per layer. Each call still checks the recurrent state arrays.
+    """
+    if state is None:
+        return None
+    if (
+        not _array_contract(state.conv_state, (1, 3, 10240), mx.bfloat16)
+        or not _array_contract(state.recurrent_state, (1, 48, 128, 128), mx.float32)
+    ):
+        return None
+    cached = layer.__dict__.get("_qwen4_gdn_prerouter_arguments")
+    if cached is not None:
+        return cached or None
+    if not _qwen4_gdn_prerouter_contract(layer, state):
+        object.__setattr__(layer, "_qwen4_gdn_prerouter_arguments", ())
         return None
     try:
         from mlx_kquant import qwen4_gdn_prerouter_q6
     except ImportError:
-        _GDN_PREROUTER_CALL_COUNTS["fallback_contract"] += 1
         return None
     if not callable(qwen4_gdn_prerouter_q6):
-        _GDN_PREROUTER_CALL_COUNTS["fallback_contract"] += 1
         return None
+    arguments = _prerouter_arguments(layer, qwen4_gdn_prerouter_q6)
+    object.__setattr__(layer, "_qwen4_gdn_prerouter_arguments", arguments)
+    return arguments
 
+
+def _prerouter_arguments(layer: Any, operation):
     attention = layer.attention_residual
     mlp = layer.mlp_residual
     module = layer.mixer.module
-    outputs = qwen4_gdn_prerouter_q6(
-        hidden_states,
+    before_state = (
         attention.hc_norm.weight,
         attention.input_mix_weight_down.weight,
         attention.input_mix_weight_down.scales,
@@ -196,34 +248,10 @@ def qwen4_gdn_prerouter_step(
         module.in_proj_b.scales,
         module.in_proj_a.weight,
         module.in_proj_a.scales,
-        state.conv_state,
-        module.conv1d.weight,
-        module.A_log,
-        module.dt_bias,
-        state.recurrent_state,
-        module.norm.weight,
-        module.out_proj.weight,
-        module.out_proj.scales,
-        pending_output,
-        pending_injection,
-        eps=float(module.norm.eps),
     )
-    if not isinstance(outputs, (tuple, list)) or len(outputs) != 5:
-        raise RuntimeError("native Qwen GDN pre-router returned an invalid result")
-    mlp_hidden, residual, injection, conv_state, recurrent_state = outputs
-    next_state = Qwen4GDNState(
-        conv_state=conv_state,
-        recurrent_state=recurrent_state,
-        offset=state.offset + 1,
-    )
-    _GDN_PREROUTER_CALL_COUNTS["native_calls"] += 1
-    return Qwen4GDNPreRouterResult(
-        mlp_hidden=mlp_hidden,
-        residual=residual,
-        injection=injection,
-        state=next_state,
-        frontier=next_state.offset,
-    )
+    between_states = (module.conv1d.weight, module.A_log, module.dt_bias)
+    after_state = (module.norm.weight, module.out_proj.weight, module.out_proj.scales)
+    return operation, before_state, between_states, after_state, float(module.norm.eps)
 
 
 def _qwen4_gdn_native_input_supported(module: Any, inputs: mx.array) -> bool:

@@ -313,6 +313,7 @@ class _Qwen4PlainSerialStep:
     state: Qwen4CompositeState
     append_finite_check: _Qwen4AppendFiniteCheck | None
     consumed: bool = False
+    deferred_drain: bool = False
 
 
 class Qwen4PlainSerialLane:
@@ -428,15 +429,28 @@ class Qwen4PlainSerialLane:
             token_count=1,
             physical_frontier=base.frontier,
         )
+        session = getattr(self._model, "_moespresso_pooled_decode_session", None)
+        deferred = session is not None and session.active
         try:
-            logits, next_state, append_finite_check = self._model._forward_chunk(
-                base,
-                input_ids,
-                valid_tokens,
-                position_ids,
-                trusted=True,
-                serial_capability=_QWEN4_SERIAL_LANE_CAPABILITY,
-            )
+            if deferred:
+                with session.deferred_token_drain():
+                    logits, next_state, append_finite_check = self._model._forward_chunk(
+                        base,
+                        input_ids,
+                        valid_tokens,
+                        position_ids,
+                        trusted=True,
+                        serial_capability=_QWEN4_SERIAL_LANE_CAPABILITY,
+                    )
+            else:
+                logits, next_state, append_finite_check = self._model._forward_chunk(
+                    base,
+                    input_ids,
+                    valid_tokens,
+                    position_ids,
+                    trusted=True,
+                    serial_capability=_QWEN4_SERIAL_LANE_CAPABILITY,
+                )
         except BaseException:
             step.consumed = True
             self._fail(step.state)
@@ -449,6 +463,7 @@ class Qwen4PlainSerialLane:
             logits=logits,
             state=next_state,
             append_finite_check=append_finite_check,
+            deferred_drain=deferred,
         )
         self._superseded = step
         self._pending = next_step
@@ -498,6 +513,7 @@ class Qwen4PlainSerialLane:
             if next_step.append_finite_check is not None:
                 next_roots = (*next_roots, next_step.append_finite_check.predicate)
             self._scheduled_roots = next_roots
+            self._drain_deferred_step(step)
             self._eval_pipelined_step(step, evaluated=evaluated)
         except BaseException:
             step.consumed = True
@@ -520,6 +536,7 @@ class Qwen4PlainSerialLane:
 
         self._require_pipeline_step(step)
         try:
+            self._drain_deferred_step(step)
             self._model._eval_serial_boundary(
                 evaluated,
                 step.state,
@@ -549,6 +566,12 @@ class Qwen4PlainSerialLane:
             raise ValueError("Qwen4 plain serial pipeline step is unissued or stale")
         if step.consumed:
             raise ValueError("Qwen4 plain serial pipeline step has already been consumed")
+
+    def _drain_deferred_step(self, step: _Qwen4PlainSerialStep) -> None:
+        """Surface a deferred row's worker failures before its state is published."""
+        if step.deferred_drain:
+            self._model._moespresso_pooled_decode_session.drain_token()
+            step.deferred_drain = False
 
     def _eval_pipelined_step(
         self,

@@ -8,6 +8,7 @@ quality gates pass, the serving cache and Metal kernels.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import cached_property
 
 
 QWEN38_KVARN_SCHEMA = "qwen38-qsa-kvarn-k4v4-g128-d256-h2-i8-fp16meta-sylvester-v1"
@@ -67,7 +68,7 @@ class Qwen4KVarNLayout:
     def code_bytes(self) -> int:
         return self.tile_tokens * self.head_dim // 2
 
-    @property
+    @cached_property
     def fields(self) -> tuple[Qwen4KVarNField, ...]:
         offset = 0
         result = []
@@ -91,11 +92,11 @@ class Qwen4KVarNLayout:
                 return field
         raise KeyError(name)
 
-    @property
+    @cached_property
     def head_record_bytes(self) -> int:
         return self.fields[-1].end
 
-    @property
+    @cached_property
     def tile_record_bytes(self) -> int:
         return self.kv_heads * self.head_record_bytes
 

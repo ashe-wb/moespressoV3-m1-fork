@@ -438,6 +438,27 @@ def test_bounded_plain_serial_pipeline_is_enabled_when_structurally_eligible() -
     assert model.committed == [2, 3]
 
 
+@pytest.mark.parametrize("bounded", [False, True])
+def test_wired_limit_is_raised_only_for_full_residency(monkeypatch, bounded) -> None:
+    import importlib
+
+    generate_module = importlib.import_module("mlx_lm.generate")
+    entered = []
+
+    @contextmanager
+    def recording_wired_limit(model, streams=None):
+        entered.append(model)
+        yield
+
+    monkeypatch.setattr(generate_module, "wired_limit", recording_wired_limit)
+    model = _Model(bounded=bounded)
+
+    result = _run(model, prefill_step_size=64)
+
+    assert result.generated_token_ids == (2, 3, 7)
+    assert entered == ([] if bounded else [model])
+
+
 def test_bounded_pipeline_releases_lane_owner_before_coordinator_close(
 ) -> None:
     model = _Model(

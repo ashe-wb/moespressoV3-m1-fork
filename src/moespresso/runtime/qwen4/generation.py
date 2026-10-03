@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack, contextmanager, nullcontext
 from dataclasses import dataclass
+import os
 import time
 from typing import Any, Callable
 
@@ -16,8 +17,10 @@ from moespresso.runtime.kv_policy import KVPolicy, LIVE_KV_RAW, validate_runtime
 QWEN4_GENERATION_ADAPTER = "qwen4_composite_v1"
 QWEN4_LIVE_CACHE_FORMAT = "qwen_kvarn_k4v4"
 DEFAULT_QWEN4_PREFILL_STEP_SIZE = 2048
-_PRESSURE_PREFILL_STEP_SIZE = 512
-_PREFILL_ACTIVE_HEADROOM_BYTES = 7 << 30
+_PRESSURE_PREFILL_STEP_SIZE = int(os.environ.get("MOESPRESSO_QWEN4_PRESSURE_PREFILL_STEP", "512"))
+_PREFILL_ACTIVE_HEADROOM_BYTES = int(
+    float(os.environ.get("MOESPRESSO_QWEN4_PREFILL_HEADROOM_GB", "7")) * (1 << 30)
+)
 _PREFILL_HOST_RESERVE_BYTES = 3 << 30
 _PREFILL_MAX_FREE_CACHE_BYTES = 4 << 30
 
@@ -85,6 +88,19 @@ def _limited_free_cache(limit: int):
             mx.clear_cache()
         finally:
             mx.set_cache_limit(previous)
+
+
+def _raise_wired_limit(model: Any) -> bool:
+    """Return whether generation should raise MLX's wired limit.
+
+    Bounded expert pools are sized close to the host's wired-memory budget.
+    Wiring that working set made the GPU driver repeatedly wire and unwire
+    pool buffers on a 32 GB M1 Max running macOS 27: decode fell from 12.1 to
+    0.6 tokens/s with 224-237 slots per layer, and system CPU time grew with
+    pool capacity. Generated tokens were identical in both configurations.
+    Full residency keeps the mlx-lm wired limit.
+    """
+    return not bool(getattr(model, "_moespresso_pooled_decode_bounded", False))
 
 
 def is_qwen4_generation_model(model: Any) -> bool:
@@ -376,6 +392,13 @@ def generate_qwen4_with_metadata(
     serial_lane = None
     contexts = ExitStack()
     pipeline_scope = ExitStack()
+    from moespresso.runtime.qwen4 import autonomous
+    from moespresso.runtime.qwen4.moe import _AUTONOMOUS
+
+    if _AUTONOMOUS and getattr(model, "_cache_routing_enabled", False):
+        residency = autonomous.install_autonomous_residency(model)
+        # Research flag: chunks extending a cached prefix may use cache-prior routing.
+        residency.prefill_cache_routing = cached_tokens > 0
     started = time.perf_counter()
     first_token_seconds = None
     finish_reason = "length"
@@ -384,7 +407,8 @@ def generate_qwen4_with_metadata(
     try:
         from mlx_lm.generate import generation_stream, wired_limit
 
-        contexts.enter_context(wired_limit(model, [generation_stream]))
+        if _raise_wired_limit(model):
+            contexts.enter_context(wired_limit(model, [generation_stream]))
         contexts.enter_context(mx.stream(generation_stream))
         prefill_cache_scope = (
             _limited_free_cache(memory_policy[1])
@@ -471,6 +495,7 @@ def generate_qwen4_with_metadata(
 
         for step in range(1, requested_tokens + 1):
             token = int(sampled.item())
+            autonomous.autonomous_boundary(model, queued=int(pipeline_step is not None))
             vector_logprobs = logprobs.squeeze(0)
             if first_token_seconds is None:
                 first_token_seconds = time.perf_counter() - started
@@ -592,7 +617,10 @@ def generate_qwen4_with_metadata(
                 if serial_lane is not None:
                     serial_lane.close()
             finally:
-                pipeline_scope.close()
+                try:
+                    autonomous.autonomous_finish(model)
+                finally:
+                    pipeline_scope.close()
         finally:
             try:
                 if coordinator is not None:

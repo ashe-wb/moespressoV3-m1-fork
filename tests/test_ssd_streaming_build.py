@@ -573,7 +573,9 @@ def test_combined_kquant_gate_up_dispatches_two_routed_gathers(
     assert stats["expert_loads"] == 8
     assert stats["bundle_row_preads"] == 4
     assert stats["bundle_row_read_bytes"] == 4 * switch.gate_proj.pool.row_cache.index.row_bytes(layer=0)
-    assert stats["bundle_cached_takes"] == 4
+    # The four-expert miss is prefetched concurrently, so both pools take
+    # every row from the cache.
+    assert stats["bundle_cached_takes"] == 8
     assert stats["routed_matmul_calls"] == 2
     assert stats["routed_gate_matmul_calls"] == 1
     assert stats["routed_up_matmul_calls"] == 0

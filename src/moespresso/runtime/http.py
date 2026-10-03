@@ -2087,6 +2087,10 @@ def main(
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry; "
                              "RSS remains a separate process measurement.")
+    parser.add_argument("--expert-capacity-profile", type=Path, default=None,
+                        help="Qwen4 bounded pools: redistribute the planner's expert "
+                             "slots across layers in the proportions of this "
+                             "package-bound JSON profile. Total pool memory is unchanged.")
     from moespresso.runtime.serve import (
         add_runtime_limit_arguments,
         add_cache_routing_argument,
@@ -2124,6 +2128,11 @@ def main(
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
+    if args.expert_capacity_profile is not None:
+        import os as _os_profile
+        _os_profile.environ["MOESPRESSO_QWEN4_CAPACITY_PROFILE"] = str(
+            args.expert_capacity_profile.expanduser().resolve()
+        )
     manifest = _preflight_manifest_for_cli(Path(args.package_dir))
     if manifest is not None:
         from moespresso.runtime.prefix_cache import effective_context_limit

@@ -7,6 +7,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
 import json
 import os
+import time
 from pathlib import Path, PurePosixPath, PureWindowsPath
 from typing import Any
 
@@ -172,6 +173,7 @@ def hydrate_qwen4_package_weights(
     return loaded_count
 
 
+_LIVE_MEMORY_SETTLE_SECONDS = 20.0
 _QWEN4_LAYER_COUNT = 48
 _QWEN4_EXPERT_COUNT = 512
 _QWEN4_HIDDEN_SIZE = 2560
@@ -691,6 +693,30 @@ def _qwen4_capacity_budget(
     available_bytes, resolution = _resolved_available_bytes(
         strict_live_available=True,
     )
+    # A server restarted right after its predecessor exits can observe memory
+    # the old process is still releasing. With an explicit ceiling, give live
+    # memory a bounded window to recover before sizing pools from it.
+    deadline = time.monotonic() + _LIVE_MEMORY_SETTLE_SECONDS
+    announced = False
+    while (
+        resolution.get("explicit_ceiling_bytes") is not None
+        and resolution.get("limiting_source") == "live-available"
+        and time.monotonic() < deadline
+    ):
+        if not announced:
+            print(
+                "[serve] live memory is below --max-memory-gb; waiting up to "
+                f"{_LIVE_MEMORY_SETTLE_SECONDS:.0f}s while it is still being released",
+                flush=True,
+            )
+            announced = True
+        time.sleep(1.0)
+        previous = available_bytes
+        available_bytes, resolution = _resolved_available_bytes(
+            strict_live_available=True,
+        )
+        if available_bytes - previous < (1 << 28):
+            break
     if resolution_out is not None:
         resolution_out.update(resolution)
 
@@ -890,6 +916,34 @@ def load_qwen4_iqk_package_model(
             for layer, capacity in overrides.items()
         ):
             raise _fail("capacity_overrides must map released layers to positive integers")
+        profile_path = os.environ.get("MOESPRESSO_QWEN4_CAPACITY_PROFILE")
+        if (
+            profile_path
+            and capacity_budget is not None
+            and not overrides
+            and capacity_per_layer < _QWEN4_EXPERT_COUNT
+        ):
+            from moespresso.runtime.qwen4.capacity_profile import (
+                read_capacity_profile,
+                scale_capacity_profile,
+            )
+
+            weights = read_capacity_profile(
+                profile_path,
+                package_manifest_id=manifest.get("artifact_id"),
+                layers=_QWEN4_LAYER_COUNT,
+            )
+            overrides = scale_capacity_profile(
+                weights,
+                capacity_per_layer * _QWEN4_LAYER_COUNT,
+                min_capacity=int(capacity_budget["min_capacity"]),
+                max_capacity=_QWEN4_EXPERT_COUNT,
+            )
+            capacity_budget["capacity_profile"] = {
+                "path": str(profile_path),
+                "uniform_capacity": capacity_per_layer,
+                "total_slots": sum(overrides.values()),
+            }
         if expert_builder is None:
             from moespresso.runtime.qwen4.expert_provider import (
                 build_qwen4_pooled_expert_executor,
@@ -948,6 +1002,12 @@ def load_qwen4_iqk_package_model(
                 for pool in executor._projection_pools_lockstep()
             ),
         )
+        if model._moespresso_pooled_decode_bounded:
+            # Each bounded prefill chunk streams most routed experts again, so
+            # larger chunks need fewer sweeps. A 5,783-token prompt measured
+            # 82 s at 2,048 and 74 s at 4,096 tokens per chunk on a 32 GB M1
+            # Max; the memory-pressure policy still shrinks chunks.
+            object.__setattr__(model, "_moespresso_qwen4_prefill_step_size", 4096)
         model.layers[-1].mlp.pipeline_is_last = True
         if install_iqk_dense_fn is None:
             from moespresso.runtime.qwen4.iqk_dense import (

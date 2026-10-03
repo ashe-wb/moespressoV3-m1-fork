@@ -2,6 +2,20 @@
 
 # MoEspresso
 
+> **This is an unofficial fork.** MoEspresso is created and maintained by
+> Riccardo Chiumiento ([steadfastgaze](https://github.com/steadfastgaze)) at
+> [steadfastgaze/MoEspresso](https://github.com/steadfastgaze/MoEspresso).
+> The architecture, runtime, package format, quantization pipeline, model
+> packages, benchmarks and documentation are his work. This fork, published by
+> [ashe-wb](https://github.com/ashe-wb), adds only the bounded decode and
+> prefill changes for Qwen3.8-Flash-Next on 32 GB M1 Max hosts listed in
+> [what this fork changes](#what-this-fork-changes), and is not affiliated
+> with or endorsed by the upstream project. Report issues with this fork's
+> changes here, and use the upstream repository for everything else. The model
+> packages and Homebrew tap linked below are published upstream and install
+> the upstream release. Results outside that section are upstream's release
+> measurements.
+
 MoEspresso runs large Mixture-of-Experts language models at practical speed on
 Apple Silicon, including Macs whose memory is much smaller than the model
 package.
@@ -26,6 +40,91 @@ Cache-Prior policy used for 32 GB serving scored **84.3%**, ahead of Claude Opus
 The physical speed grid used the complete 48-layer package at capacity 223, a
 24 GB planner ceiling, a 43-token prompt, 32 generated tokens, greedy decoding,
 and disk KV disabled.
+
+## What this fork changes
+
+The fork targets Qwen3.8-Flash-Next on a 2021 M1 Max with a 32-core GPU and
+32 GB of unified memory, running macOS 27 at a 24 GB planner ceiling, which
+resolves to 209 expert slots per layer. Unless noted, measurements used greedy
+decoding with disk KV disabled. Mechanisms and switches are in
+[Qwen3.8 architecture and serving](docs/qwen4.md).
+
+### Improvements
+
+- **Bounded pools no longer wire the expert working set.** On macOS 27 the
+  mlx-lm wired limit made the GPU driver repeatedly wire and unwire pool
+  buffers, and decode fell to 0.6 tokens/s. Skipping it for bounded pools
+  restored 14.0 tokens/s with identical generated tokens. Full residency keeps
+  the wired limit.
+- **Faster bounded decode.** Concurrent row prefetch for multi-expert misses,
+  fused ring and table routed kernels, fused QSA decode attention, a faster
+  top-10 selection kernel, a stacked shared-expert projection and host-side
+  caching of per-layer arguments. Except for QSA decode attention, each change
+  is bit-identical to the path it replaces.
+- **Faster bounded prefill.** Packed IQ_K tiles run over each chunk's routed
+  pairs, rows stream ahead of pool loads, chunks and disk checkpoints use
+  4,096-token frontiers, and a fused kernel computes QSA prefill attention.
+- **Per-layer capacity profiles.** `--expert-capacity-profile PATH` or
+  `MOESPRESSO_QWEN4_CAPACITY_PROFILE` redistributes expert slots across layers
+  from a JSON weight profile. The repository reads profiles and includes no
+  profile or profile generator.
+- **Opt-in GPU-autonomous decode.** `MOESPRESSO_QWEN4_AUTONOMOUS=1` routes each
+  token among resident experts only and loads missing originals in the
+  background, so the GPU never waits for the host within a token.
+
+### Results
+
+| Measurement | Before | After |
+|---|---:|---:|
+| Decode, Cache-Prior 2/2 | 14.0 tok/s | 17.1 tok/s |
+| Decode, GPU-autonomous (opt-in) | | 25.0 tok/s |
+| Time to first token, 1,078-token prompt | 34 s | 12 s |
+| Time to first token, 5,783-token prompt | 125 s | 56 s |
+| Time to first token, 3,286-token served prompt with disk checkpoints | 108 s | 34 s |
+
+The 14.0 tokens/s baseline used the public mlx-kquant pin after the wired-limit
+fix. The 17.1 and 25.0 tokens/s results averaged four prompts with 192
+generated tokens each, and the prefill runs used a 25 GB ceiling. These runs,
+and the sweep below, used an additional mlx-kquant kernel change and a
+per-layer capacity profile, neither of which this repository includes, with
+the host's `iogpu.wired_lwm_mb` set to 20000. Without that setting, about one
+run in four at 24 GB fell below 6 tokens/s when macOS compressed idle pool
+pages. The published configuration has not been re-measured, so expect
+somewhat lower decode rates.
+
+A cold long-context sweep at 24 GB served the full 131,072-token limit without
+a memory abort:
+
+| Prompt tokens | Time to first token | Prefill tok/s | Decode tok/s |
+|---:|---:|---:|---:|
+| 3,902 | 29 s | 134 | 12.4 |
+| 32,558 | 284 s | 115 | 11.8 |
+| 65,325 | 615 s | 106 | 11.3 |
+| 126,736 | 1,218 s | 104 | 10.7 |
+
+This sweep generated code explanations, a different workload from the
+four-prompt decode benchmark, and ran without the MLX command-buffer settings
+the server applies, so its decode rates are likely understated.
+
+### Trade-offs
+
+- **Fused QSA attention is approximate.** Fused prefill attention matched the
+  gathered path bit for bit on 99.9% of outputs and fused decode attention on
+  99.995%, with the remainder within one BF16 step. Greedy output can change
+  at near ties. With Cache-Prior 2/2, teacher-forced NLL moved from 1.1762 to
+  1.1788 and top-1 agreement from 0.769 to 0.771. Both kernels are on by
+  default. `MOESPRESSO_QWEN4_FUSED_QSA_PREFILL=0` and
+  `MOESPRESSO_QWEN4_FUSED_QSA_DECODE=0` restore the gathered paths.
+- **GPU-autonomous decode costs quality.** Teacher-forced on exact-routing
+  greedy references, NLL was 1.1618 for exact routing, 1.1762 for Cache-Prior
+  2/2 and 1.2057 for autonomous decode, with top-1 agreement of 0.795, 0.769
+  and 0.761. It stays off by default.
+- **The benchmark score is upstream's.** The 84.3% generated-answer result
+  was measured on upstream's default path and has not been repeated with this
+  fork's fused attention kernels.
+- **Three tests fail on the measurement host.** Three tolerance tests in
+  `tests/test_qwen4_qsa_runtime.py` exceed their 2e-5 bound by about 4e-5 on
+  this GPU. They fail identically on the unmodified upstream tree.
 
 ## MoEspresso 3 package
 
@@ -330,6 +429,10 @@ runtime behavior.
 
 ## Acknowledgements
 
+This fork is built entirely on MoEspresso by
+[Riccardo Chiumiento](https://github.com/steadfastgaze), who designed and wrote
+the project and published its model packages.
+
 MoEspresso builds on a large body of open work. The complete per-file record is
 in `THIRD-PARTY-NOTICES`.
 
@@ -385,3 +488,11 @@ MoEspresso is dual-licensed under Apache 2.0 (`LICENSE-APACHE-2.0`) or MIT
 `THIRD-PARTY-NOTICES` records the attribution and upstream revision for
 third-party code that ships in this repository. The wheel and source
 distribution carry it with both license files.
+
+MoEspresso is Copyright (c) 2026 Riccardo Chiumiento, and his notice in
+`LICENSE-MIT` is retained unchanged. This fork modifies files relative to
+upstream commit
+[`6b96f27`](https://github.com/steadfastgaze/MoEspresso/commit/6b96f27)
+and adds new files under `src/moespresso/runtime/qwen4/` and `tests/`. The
+commit history records every changed file. The fork's changes are offered
+under the same dual Apache 2.0 or MIT license.

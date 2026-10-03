@@ -9,9 +9,11 @@ are loaded directly into MLX buffers via `pread_into`.
 from __future__ import annotations
 
 from concurrent.futures import CancelledError, ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import partial
 import os
+import threading
 import time
 from types import MethodType
 
@@ -32,6 +34,21 @@ _PROJECTION_LOAD_EXECUTOR = ThreadPoolExecutor(
     max_workers=3,
     thread_name_prefix="moespresso-ssd-proj",
 )
+
+# Concurrent bundle-row reads for one small demand miss set. Kept separate from
+# the projection executor, whose workers wait on these reads.
+_ROW_READ_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4,
+    thread_name_prefix="moespresso-ssd-row",
+)
+_ROW_PREFETCH_MAX_ROWS = 16
+# Ordered read-ahead for large miss sets (prefill). One producer thread keeps a
+# bounded window of rows in flight on the row-read executor.
+_ROW_STREAM_EXECUTOR = ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="moespresso-ssd-row-stream",
+)
+_ROW_STREAM_WINDOW = 24
 
 # Single ORDERED worker for the pipelined decode: FIFO == layer order, so
 # kicks commit in layer order and the eviction fence semantics are preserved.
@@ -815,6 +832,7 @@ class PooledSwitchGLU(nn.Module):
         self.projection_no_miss_calls = 0
         self.projection_load_wait_seconds = 0.0
         self.projection_load_parallel_calls = 0
+        self.projection_row_prefetch_calls = 0
         self.projection_sync_join_calls = 0
         self.projection_tracked_join_calls = 0
         self.overlap_load_started_calls = 0
@@ -1289,19 +1307,79 @@ class PooledSwitchGLU(nn.Module):
             for pool in pools
             if pool.missing_count(active)
         ]
-        if len(missing_pools) < 2:
-            try:
+        row_reads = self._prefetch_missing_rows(active, missing_pools)
+        try:
+            if len(missing_pools) < 2:
                 for pool in pools:
                     pool.ensure(active)
-            finally:
-                self.projection_load_wait_seconds += time.perf_counter() - t0
-            return
-
-        self.projection_load_parallel_calls += 1
-        try:
-            self._join_projection_loads(partial(pool.ensure, active) for pool in pools)
+                return
+            self.projection_load_parallel_calls += 1
+            with self._streamed_row_reads(active, missing_pools):
+                self._join_projection_loads(partial(pool.ensure, active) for pool in pools)
         finally:
+            for future in row_reads:
+                future.exception()
             self.projection_load_wait_seconds += time.perf_counter() - t0
+
+    def _prefetch_missing_rows(self, active: set[int], missing_pools) -> list:
+        """Read a small miss set's shared bundle rows concurrently.
+
+        Projection pools load their missed experts in order, one row read per
+        expert. Cold 1.75 MB reads measured 0.43 ms alone and 0.64 ms for four
+        concurrent reads, so a demand miss of several experts waits for one
+        read latency instead of one per expert. Sets larger than the shared
+        row cache keep the ordered path, which never evicts an unconsumed row.
+        """
+        if not missing_pools:
+            return []
+        cache = missing_pools[0].row_cache
+        if cache is None or any(pool.row_cache is not cache for pool in missing_pools):
+            return []
+        missing = set()
+        for pool in missing_pools:
+            missing.update(expert for expert in active if expert not in pool._slot_of)
+        if not 2 <= len(missing) <= min(_ROW_PREFETCH_MAX_ROWS, cache.max_rows):
+            return []
+        self.projection_row_prefetch_calls += 1
+        return cache.prefetch(sorted(missing), _ROW_READ_EXECUTOR)
+
+    @contextmanager
+    def _streamed_row_reads(self, active: set[int], pools):
+        """Read a large miss set's shared rows ahead of the ordered pool loads.
+
+        Pools load missed experts in ascending order, one row read at a time.
+        Keeping several reads in flight ahead of them raises SSD throughput
+        during prefill. Read-ahead stays below the shared cache window, so a
+        row is never evicted before its consumers take it.
+        """
+        cache = pools[0].row_cache if pools else None
+        missing = [] if cache is None else sorted(
+            expert for expert in active if any(expert not in pool._slot_of for pool in pools)
+        )
+        if (
+            cache is None
+            or any(pool.row_cache is not cache for pool in pools)
+            or len(missing) <= _ROW_PREFETCH_MAX_ROWS
+            or cache.max_rows <= _ROW_STREAM_WINDOW
+        ):
+            yield
+            return
+        stop = threading.Event()
+        producer = _ROW_STREAM_EXECUTOR.submit(
+            cache.stream_prefetch,
+            missing,
+            _ROW_READ_EXECUTOR,
+            window=_ROW_STREAM_WINDOW,
+            consumed=lambda expert: all(expert in pool._slot_of for pool in pools),
+            stop=stop,
+        )
+        self.projection_row_stream_calls = getattr(self, "projection_row_stream_calls", 0) + 1
+        try:
+            yield
+        finally:
+            stop.set()
+            for future in producer.result():
+                future.exception()
 
     def _project_triplet(
         self,
@@ -2252,10 +2330,11 @@ class PooledSwitchGLU(nn.Module):
                 fence=False,
             ):
                 return
-            self._join_projection_loads(
-                partial(pool.ensure, active_set, protect=protect_set, fence=False)
-                for pool in pools
-            )
+            with self._streamed_row_reads(active_set, pools):
+                self._join_projection_loads(
+                    partial(pool.ensure, active_set, protect=protect_set, fence=False)
+                    for pool in pools
+                )
 
         # chunk 0 loads up front (nothing to overlap with yet)
         _ensure_ahead(chunk_sets[0], set())

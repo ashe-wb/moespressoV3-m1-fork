@@ -1184,6 +1184,122 @@ def test_bundle_row_cache_failed_pread_stays_fail_closed(tmp_path):
     assert 3 in pool.resident_ids()
 
 
+def test_bundle_row_cache_prefetch_serves_three_pools_once(tmp_path):
+    """Prefetched rows are read concurrently once and consumed by all three pools."""
+    import concurrent.futures
+
+    import numpy as np
+
+    from moespresso.runtime.expert_slot_pool import BundleRowCache
+
+    resident = _resident_switch(n_experts=16)
+    pkg = _package_from_resident(tmp_path, resident)
+    index = build_expert_index(pkg)
+    cache = BundleRowCache(package_dir=pkg, index=index, layer=0)
+    cached = {
+        proj: ExpertSlotPool(package_dir=pkg, index=index, layer=0,
+                             projection=proj, capacity=8, row_cache=cache)
+        for proj in ("gate_proj", "up_proj", "down_proj")
+    }
+    plain = {
+        proj: ExpertSlotPool(package_dir=pkg, index=index, layer=0,
+                             projection=proj, capacity=8)
+        for proj in cached
+    }
+    active = [2, 6, 11]
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=4) as reads:
+        futures = cache.prefetch(active, reads)
+        assert cache.prefetch(active, reads) == []  # claimed rows are not reread
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            for f in [ex.submit(p.ensure, active) for p in cached.values()]:
+                f.result()
+        for future in futures:
+            future.result()
+    for p in plain.values():
+        p.ensure(active)
+
+    assert cache.total_preads == len(active)
+    assert cache.total_prefetched_rows == len(active)
+    assert cache.total_cached_takes == 3 * len(active)
+    assert not cache._rows and not cache._inflight
+    for proj in cached:
+        a, b = cached[proj], plain[proj]
+        for e in active:
+            sa, sb = a.slot_of(e), b.slot_of(e)
+            assert np.array_equal(np.array(a.packed[sa]), np.array(b.packed[sb]))
+            assert np.array_equal(np.array(a.scales[sa]), np.array(b.scales[sb]))
+
+
+def test_bundle_row_cache_failed_prefetch_leaves_take_fail_closed(tmp_path):
+    """A failed prefetch publishes nothing, and the demand take rereads the row."""
+    import concurrent.futures
+
+    import pytest as _pytest
+
+    from moespresso.runtime import expert_slot_pool as esp
+
+    resident = _resident_switch(n_experts=16)
+    pkg = _package_from_resident(tmp_path, resident)
+    index = build_expert_index(pkg)
+    cache = esp.BundleRowCache(package_dir=pkg, index=index, layer=0)
+    pool = ExpertSlotPool(package_dir=pkg, index=index, layer=0,
+                          projection="gate_proj", capacity=4, row_cache=cache)
+
+    real_pread = esp.pread_view_cached
+
+    def failing_pread(*args, **kwargs):
+        raise OSError("injected pread failure")
+
+    esp.pread_view_cached = failing_pread
+    try:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=2) as reads:
+            for future in cache.prefetch([3, 4], reads):
+                assert future.result() is None
+        assert not cache._rows and not cache._inflight
+        with _pytest.raises(OSError, match="injected"):
+            pool.ensure([3])
+    finally:
+        esp.pread_view_cached = real_pread
+
+    assert cache.total_prefetched_rows == 0
+    pool.ensure([3, 4])
+    assert {3, 4} <= set(pool.resident_ids())
+
+
+def test_projection_ensure_prefetches_only_small_multi_row_misses(tmp_path, monkeypatch):
+    """Demand ensure prefetches a multi-expert miss set and joins every read."""
+    import moespresso.runtime.pooled_switchglu as psg
+
+    from moespresso.runtime.expert_slot_pool import BundleRowCache
+
+    resident = _resident_switch(n_experts=16)
+    pkg = _package_from_resident(tmp_path, resident)
+    index = build_expert_index(pkg)
+    cache = BundleRowCache(package_dir=pkg, index=index, layer=0)
+    switch = PooledSwitchGLU(
+        **{
+            projection: PooledMxfp4SwitchLinear(
+                package_dir=pkg, index=index, layer=0, projection=projection,
+                capacity=8, row_cache=cache,
+            )
+            for projection in ("gate_proj", "up_proj", "down_proj")
+        },
+        activation=resident.activation,
+    )
+
+    switch._ensure_projection_pools({1})
+    assert switch.projection_row_prefetch_calls == 0
+    switch._ensure_projection_pools({2, 3, 4})
+    assert switch.projection_row_prefetch_calls == 1
+    assert cache.total_prefetched_rows == 3
+    assert not cache._inflight
+
+    monkeypatch.setattr(psg, "_ROW_PREFETCH_MAX_ROWS", 0)
+    switch._ensure_projection_pools({5, 6})
+    assert switch.projection_row_prefetch_calls == 1
+
+
 def test_route_trace_captures_prefill_and_decode(tmp_path):
     """Route-trace oracle study: opt-in route tracing records position-intact
     prefill routes and per-step decode routes; OFF by default with zero residue."""

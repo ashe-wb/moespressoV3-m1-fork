@@ -535,6 +535,37 @@ class Qwen4MutableKVarNQSAStateBackend:
         )
         return result
 
+    def _attend_selected_rows_deferred_finite(
+        self,
+        state: Qwen4MutableKVarNQSAState | None,
+        pending_keys: mx.array,
+        pending_values: mx.array,
+        selected_indices: mx.array,
+        queries: mx.array,
+        *,
+        scale: float,
+        capability: object,
+        ascending_unique: bool = False,
+    ) -> mx.array | None:
+        """Fused decode attention with the deferred-gather checks, or None."""
+        if capability is not _QSA_DEFER_PENDING_FINITE_CAPABILITY:
+            raise ValueError("Qwen KVarN deferred finite capability is invalid")
+        if state is None:
+            return None
+        storage = self._validate_state(state)
+        output = storage._attend_selected_rows_with_pending_deferred_finite(
+            pending_keys,
+            pending_values,
+            selected_indices,
+            queries,
+            scale=scale,
+            ascending_unique=ascending_unique,
+        )
+        if output is not None:
+            self.deferred_pending_value_checks += 1
+            self.fused_decode_attention_calls = getattr(self, "fused_decode_attention_calls", 0) + 1
+        return output
+
     def _select_and_gather_rows_deferred_finite(
         self,
         state: Qwen4MutableKVarNQSAState | None,

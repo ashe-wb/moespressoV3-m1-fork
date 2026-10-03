@@ -275,18 +275,15 @@ class Qwen4PooledSwitchGLU(PooledSwitchGLU):
             for lock in reversed(locks):
                 lock.release()
 
-    def build_pipelined(self, value, indices, *, event_gate=None) -> mx.array:
-        """Build the generic Qwen routed graph from independently published slots."""
-        width = int(indices.shape[-1])
-        bufs = self._qwen4_pipe_bufs(width, create=True)
-        gate_buf, _gate_view, up_buf, _up_view, down_buf, _down_view = bufs
+    def _gate_pipelined_operand(self, operand, indices, event_gate):
+        """Record one pipelined routed layer and gate its operand on the event."""
+        bufs = self._qwen4_pipe_bufs(int(indices.shape[-1]), create=True)
         self.pipelined_layers += 1
         self.total_calls += 1
         self.decode_calls += 1
         self.total_token_layers += 1
         if self._all_iqk:
             self._record_iqk_route(int(indices.size))
-        operand = mx.expand_dims(value, (-2, -3))
         object.__setattr__(self, "_qwen4_pipe_event", None)
         object.__setattr__(self, "_qwen4_pipe_event_buffers", None)
         if event_gate is not None:
@@ -294,6 +291,67 @@ class Qwen4PooledSwitchGLU(PooledSwitchGLU):
             operand = gate_mod.gate(operand, token, sequence)
             object.__setattr__(self, "_qwen4_pipe_event", (gate_mod, sequence))
             object.__setattr__(self, "_qwen4_pipe_event_buffers", bufs)
+        return operand, bufs
+
+    def _ring_routed_ready(self) -> bool:
+        ready = getattr(self, "_ring_routed_ready_cached", None)
+        if ready is None:
+            from moespresso.runtime.qwen4.ring_routed import ring_routed_supported
+
+            pools = (self.gate_proj.pool, self.up_proj.pool, self.down_proj.pool)
+            ready = bool(
+                self._iqk_two_dispatch_ready()
+                and all(getattr(pool, "iqk", None) is not None for pool in pools)
+                and ring_routed_supported(*(pool.iqk for pool in pools))
+            )
+            object.__setattr__(self, "_ring_routed_ready_cached", ready)
+        return ready
+
+    def build_pipelined_weighted(
+        self, value, indices, scores, *, event_gate=None
+    ) -> mx.array | None:
+        """Build the reduced routed row with two dispatches, or return None.
+
+        This matches ``build_pipelined`` followed by the expert-major weighted
+        sum while reading the independently published gate, up and down slots
+        inside the kernels.
+        """
+        rows = 1
+        for dimension in value.shape[:-1]:
+            rows *= int(dimension)
+        if (
+            self.training
+            or rows != 1
+            or int(indices.size) != _QWEN4_ROUTED_TOP_K
+            or value.dtype != mx.bfloat16
+            or scores.dtype != mx.bfloat16
+            or not self._ring_routed_ready()
+        ):
+            return None
+        from moespresso.runtime.qwen4.ring_routed import ring_routed_decode
+
+        operand, bufs = self._gate_pipelined_operand(value, indices, event_gate)
+        gate_buf, _gate_view, up_buf, _up_view, down_buf, _down_view = bufs
+        output = ring_routed_decode(
+            self.gate_proj.pool.iqk,
+            self.up_proj.pool.iqk,
+            self.down_proj.pool.iqk,
+            operand,
+            indices,
+            scores,
+            gate_buf,
+            up_buf,
+            down_buf,
+        )
+        self.ring_routed_decode_calls = getattr(self, "ring_routed_decode_calls", 0) + 1
+        return output.reshape(value.shape)
+
+    def build_pipelined(self, value, indices, *, event_gate=None) -> mx.array:
+        """Build the generic Qwen routed graph from independently published slots."""
+        operand, bufs = self._gate_pipelined_operand(
+            mx.expand_dims(value, (-2, -3)), indices, event_gate
+        )
+        gate_buf, _gate_view, up_buf, _up_view, down_buf, _down_view = bufs
         gate_slots = gate_buf.reshape(indices.shape)
         up_slots = up_buf.reshape(indices.shape)
         down_slots = down_buf.reshape(indices.shape)
@@ -368,6 +426,43 @@ class Qwen4PaddedPooledSwitchGLU(Qwen4PooledSwitchGLU):
         self.packed_prefill_calls += 1
         self.packed_prefill_pairs += int(indices.size)
         return output
+
+    def _iqk_sorted_triplet(self, x_rows, gate_slots, up_slots, down_slots):
+        """Run bounded sorted prefill through the packed IQ_K tiles.
+
+        The generic sorted path decodes every slot of each projection pool to
+        FP16 before a gather matmul, so a chunk's cost follows pool size rather
+        than routed pairs. The packed kernels decode weight tiles in
+        threadgroup memory instead, as full-resident prefill does. Rows are
+        routed pairs, so each carries one slot (top-k of one). Gate and up share
+        one slot array, which requires identical gate and up slot maps.
+        """
+        members = tuple(self.members.get(name) for name in ("gate_proj", "up_proj", "down_proj"))
+        pools = (self.gate_proj.pool, self.up_proj.pool, self.down_proj.pool)
+        if (
+            x_rows.ndim != 2
+            or self.hidden_size != 2560
+            or self.intermediate_size != 640
+            or members[0] != members[1]
+            or any(member not in ("iq2_k", "iq2_ks", "iq3_k") for member in members)
+            or not isinstance(self.down_proj, Qwen4ZeroPaddedDownProjection)
+            or self.down_proj.stored_in_features != 768
+            or any(getattr(pool, "iqk", None) is None for pool in pools)
+            or any(pool.iqk.num_experts > 1024 for pool in pools)
+            or pools[0]._slot_of != pools[1]._slot_of
+        ):
+            return super()._iqk_sorted_triplet(x_rows, gate_slots, up_slots, down_slots)
+        from moespresso.runtime.qwen4.prefill_packed import packed_gate_up
+        from moespresso.runtime.qwen4.prefill_packed_down import packed_down
+
+        rows = int(x_rows.shape[0])
+        activation = packed_gate_up(
+            pools[0].iqk, pools[1].iqk, x_rows, gate_slots.reshape(rows, 1)
+        )
+        output = packed_down(pools[2].iqk, activation, down_slots.reshape(rows, 1))
+        self.packed_prefill_calls += 1
+        self.packed_prefill_pairs += rows
+        return output.reshape(rows, 2560)
 
     @staticmethod
     def _iqk_sorted_parts() -> int:
@@ -612,10 +707,49 @@ class Qwen4PaddedPooledSwitchGLU(Qwen4PooledSwitchGLU):
             or rows != 1
             or not self._iqk_two_dispatch_ready()
             or not self._barrier_free_decode_ready()
-            or self._iqk_decode_identity_cached is not True
         ):
             return None
+        if self._iqk_decode_identity_cached is not True:
+            return self._full_table_weighted_decode(value, source_indices, scores)
         return self._full_resident_weighted_decode(value, source_indices, scores)
+
+    def _full_table_weighted_decode(self, value, source_indices, scores) -> mx.array | None:
+        """Decode a full, non-identity pool through its fixed on-device slot tables.
+
+        A pool holding every expert never loads or evicts, so its slot tables
+        are fixed and the device can resolve slots without a host publication.
+        The routed kernels and reduction order are those of the ring path.
+        """
+        if (
+            int(source_indices.size) != _QWEN4_ROUTED_TOP_K
+            or value.dtype != mx.bfloat16
+            or scores.dtype != mx.bfloat16
+            or not self._ring_routed_ready()
+        ):
+            return None
+        tables = getattr(self, "_qwen4_full_slot_tables", None)
+        if tables is None:
+            pools = (self.gate_proj.pool, self.up_proj.pool, self.down_proj.pool)
+            for pool in pools:
+                with pool._bk_lock:
+                    if (pool.capacity != pool.num_experts
+                            or len(pool._slot_of) != pool.num_experts):
+                        return None
+            tables = tuple(pool._ensure_slot_table() for pool in pools)
+            object.__setattr__(self, "_qwen4_full_slot_tables", tables)
+        from moespresso.runtime.qwen4.ring_routed import table_routed_decode
+
+        output = table_routed_decode(
+            self.gate_proj.pool.iqk,
+            self.up_proj.pool.iqk,
+            self.down_proj.pool.iqk,
+            value,
+            source_indices,
+            scores,
+            *tables,
+        )
+        self.full_table_decode_calls = getattr(self, "full_table_decode_calls", 0) + 1
+        return output.reshape(value.shape)
 
     def try_full_resident_weighted_decode(
         self,

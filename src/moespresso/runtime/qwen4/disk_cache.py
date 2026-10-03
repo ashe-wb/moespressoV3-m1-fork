@@ -102,6 +102,24 @@ class Qwen4PromptCache:
         return restored
 
 
+def _checkpoint_stride(model, stride: int) -> int:
+    """Return the checkpoint stride used for this model's prefill.
+
+    Every checkpoint frontier ends a prefill chunk. With bounded expert pools
+    each chunk streams most routed experts from SSD again, so frontiers use the
+    model's prefill step, rounded up to a multiple of the store stride. On a
+    32 GB M1 Max a 3,286-token served prompt measured 107.8 s with 1,024-token
+    frontiers and 39.4 s without checkpoints. Full residency keeps the store
+    stride.
+    """
+    if not getattr(model, "_moespresso_pooled_decode_bounded", False):
+        return stride
+    step = getattr(model, "_moespresso_qwen4_prefill_step_size", None)
+    if isinstance(step, bool) or not isinstance(step, int) or step <= stride:
+        return stride
+    return -(-step // stride) * stride
+
+
 class Qwen4CheckpointWriter:
     """Capture aligned committed prefill state through the existing disk writer."""
 
@@ -110,7 +128,8 @@ class Qwen4CheckpointWriter:
         self.store = store
         self.session_cache_key = session_cache_key
         self.tracker = FrontierTracker(
-            stride=store.stride, restored_prefix=cached_tokens, full_tokens=full_tokens,
+            stride=_checkpoint_stride(model, store.stride),
+            restored_prefix=cached_tokens, full_tokens=full_tokens,
             scope=scope, already_written=store.has_entry, write_depth=store.write_depth_tokens,
         )
         self.written = []

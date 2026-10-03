@@ -8,6 +8,7 @@ import pytest
 
 from moespresso.runtime.qwen4.cache_routing_kernel import (
     cache_prior_route as route,
+    resident_only_route,
 )
 
 
@@ -183,3 +184,35 @@ def test_invalid_shapes_and_dtypes():
             route(bad, maps)
     with pytest.raises(ValueError, match="BF16"):
         route(logits, (maps[0].astype(mx.int32), *maps[1:]))
+
+
+def _key_order(value, expert):
+    return (1 if math.isnan(value) else 0, -math.inf if math.isnan(value) else value, expert)
+
+
+def test_resident_only_selection_breaks_ties_and_nan_by_rank_then_id():
+    rng = np.random.default_rng(9)
+    rows = rng.integers(-3, 3, (6, 512)).astype(np.float32)
+    rows[1, 17] = np.nan
+    rows[2, :] = 0.0
+    rows[3, 200:] = -np.inf
+    maps = []
+    for seed in (1, 2, 3):
+        slots = np.full(512, 512, np.uint32)
+        chosen = np.random.default_rng(seed).choice(512, 300, replace=False)
+        slots[chosen] = np.arange(300, dtype=np.uint32)
+        maps.append(slots)
+    resident = np.logical_and.reduce([m < 512 for m in maps])
+    for row in rows:
+        logits = mx.array(row).astype(mx.bfloat16)
+        _ids, _scores, _changed, original_ids = resident_only_route(
+            logits, tuple(mx.array(m) for m in maps))
+        probabilities = np.asarray(mx.softmax(logits.astype(mx.float32), axis=-1))
+        expected = sorted(range(512), key=lambda e: _key_order(float(probabilities[e]), e),
+                          reverse=True)[:10]
+        assert sorted(np.asarray(original_ids).tolist()) == sorted(expected)
+        finite = np.isfinite(np.asarray(logits.astype(mx.float32))).all()
+        if finite and not all(resident[expected]):
+            keys = [float(probabilities[e]) if resident[e] else -math.inf for e in range(512)]
+            wanted = sorted(range(512), key=lambda e: _key_order(keys[e], e), reverse=True)[:10]
+            assert sorted(np.asarray(_ids).tolist()) == sorted(wanted)

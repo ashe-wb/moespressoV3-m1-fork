@@ -10,6 +10,15 @@ import mlx.core as mx
 import mlx.nn as nn
 
 
+import os
+
+_AUTONOMOUS = os.environ.get("MOESPRESSO_QWEN4_AUTONOMOUS") == "1"
+_PREFILL_CACHE_ROUTING = os.environ.get("MOESPRESSO_QWEN4_PREFILL_CACHE_ROUTING") == "1"
+_PREFILL_CACHE_ROUTING_MAX_ROWS = int(
+    os.environ.get("MOESPRESSO_QWEN4_PREFILL_CACHE_ROUTING_MAX_ROWS", "128")
+)
+_AUTONOMOUS_KICK = int(os.environ.get("MOESPRESSO_QWEN4_AUTONOMOUS_KICK", "1"))
+_KICK_COUNTER = [0]
 _RELEASED_ROUTER_HIDDEN_SIZE = 2_560
 _RELEASED_ROUTER_EXPERTS = 512
 _RELEASED_ROUTER_TOP_K = 10
@@ -213,11 +222,32 @@ class Qwen4TopKRouter(nn.Module):
         if provider is not None:
             if self.training or hidden_states.dtype != mx.bfloat16 or hidden_states.size // self.hidden_size != 1:
                 raise ValueError("cache routing requires one BF16 inference row")
-            maps = provider.snapshot()
+            residency = getattr(self, "_autonomous_residency", None) if _AUTONOMOUS else None
+            maps = provider.snapshot() if residency is None else residency.snapshot(self)
         logits = hidden_states @ self.weight.T
+        if maps is not None and residency is not None:
+            from moespresso.runtime.qwen4.cache_routing_kernel import resident_only_route
+
+            indices, scores, _changed, original = resident_only_route(logits, maps)
+            object.__setattr__(self, "_autonomous_maps", maps)
+            residency.record(self, original)
+            return Qwen4RouterOutput(logits=logits, scores=scores, indices=indices)
         if maps is not None:
             indices, scores = provider.select(logits, maps)
             return Qwen4RouterOutput(logits=logits, scores=scores, indices=indices)
+        if (
+            _PREFILL_CACHE_ROUTING
+            and not cache_routing
+            and 1 < hidden_states.size // self.hidden_size <= _PREFILL_CACHE_ROUTING_MAX_ROWS
+            and not self.training
+            and hidden_states.dtype == mx.bfloat16
+            and getattr(getattr(self, "_autonomous_residency", None), "prefill_cache_routing", False)
+        ):
+            chunk_provider = getattr(self, "_cache_routing_provider", None)
+            chunk_maps = chunk_provider.snapshot() if chunk_provider is not None else None
+            if chunk_maps is not None:
+                indices, scores = chunk_provider.select(logits, chunk_maps)
+                return Qwen4RouterOutput(logits=logits, scores=scores, indices=indices)
         selection_logits = self._selection_logits(logits)
         decode_candidate = (
             hidden_states.ndim >= 2 and hidden_states.size // hidden_states.shape[-1] == 1
@@ -314,6 +344,46 @@ def expert_major_weighted_sum(
 
 
 _compiled_expert_major_weighted_sum = mx.compile(expert_major_weighted_sum)
+_compiled_swiglu = mx.compile(lambda gate, up: nn.silu(gate) * up)
+_compiled_gated_shared = mx.compile(lambda gate, value: mx.sigmoid(gate) * value)
+_SHARED_STACK_ROWS = 1_288
+
+
+def _stacked_shared_front(block) -> tuple | None:
+    """Return one q6_k weight holding shared gate, shared up and the expert gate rows.
+
+    Each output row of a quantized matrix-vector product depends only on its
+    own weight row, so stacking rows keeps every result bit for bit. The
+    stack is padded to a multiple of eight rows, and the original projection
+    weights become views of it.
+    """
+    cached = block.__dict__.get("_qwen4_shared_stack")
+    if cached is not None:
+        return cached or None
+    expert = block.shared_expert
+    parts = (expert.gate_proj, expert.up_proj, block.shared_expert_gate)
+    if any(
+        getattr(part, "mode", None) != "kquant"
+        or getattr(part, "kquant_type", None) != "q6_k"
+        or "bias" in part
+        for part in parts
+    ) or getattr(expert.down_proj, "mode", None) != "kquant":
+        object.__setattr__(block, "_qwen4_shared_stack", ())
+        return None
+    rows = [int(part.weight.shape[0]) for part in parts]
+    width = int(parts[0].weight.shape[1])
+    if any(int(part.weight.shape[1]) != width for part in parts) or sum(rows) > _SHARED_STACK_ROWS:
+        object.__setattr__(block, "_qwen4_shared_stack", ())
+        return None
+    padding = mx.zeros((_SHARED_STACK_ROWS - sum(rows), width), dtype=mx.uint8)
+    stacked = mx.concatenate([part.weight for part in parts] + [padding], axis=0)
+    mx.eval(stacked)
+    offsets = [0, rows[0], rows[0] + rows[1], sum(rows)]
+    for part, start, end in zip(parts, offsets, offsets[1:]):
+        part.weight = stacked[start:end]
+    cached = (stacked, parts[0].scales, offsets)
+    object.__setattr__(block, "_qwen4_shared_stack", cached)
+    return cached
 
 
 def _token_rows(hidden_states: mx.array) -> int:
@@ -401,6 +471,32 @@ class Qwen4SparseMoEBlock(nn.Module):
     def __call__(self, hidden_states: mx.array, *, cache_routing: bool = False) -> mx.array:
         router = (self.gate(hidden_states, cache_routing=True) if cache_routing
                   else self.gate(hidden_states))
+        maps = getattr(self.gate, "_autonomous_maps", None)
+        if maps is not None:
+            object.__setattr__(self.gate, "_autonomous_maps", None)
+            if self.experts._ring_routed_ready():
+                from moespresso.runtime.qwen4.ring_routed import table_routed_decode
+
+                pools = (self.experts.gate_proj.pool, self.experts.up_proj.pool,
+                         self.experts.down_proj.pool)
+                tables = self.gate._autonomous_residency.decode_tables(self.gate, maps)
+                routed = table_routed_decode(
+                    *(pool.iqk for pool in pools), hidden_states, router.indices,
+                    router.scores, *tables,
+                ).reshape(hidden_states.shape)
+                shared = self._shared_output(hidden_states)
+                session = getattr(self.experts, "_moespresso_pooled_decode_session", None)
+                if (getattr(self, "pipeline_is_last", False) and session is not None
+                        and session.active and session.defers_token_drain):
+                    session.mark_token_boundary()
+                output = routed + shared
+                if _AUTONOMOUS_KICK:
+                    # Start the device on built layers while later layers are built.
+                    _KICK_COUNTER[0] += 1
+                    if (_KICK_COUNTER[0] % _AUTONOMOUS_KICK == 0
+                            or getattr(self, "pipeline_is_last", False)):
+                        mx.async_eval(output)
+                return output
         if self.retained_source_ids is None:
             expert_indices = router.indices
         else:
@@ -456,10 +552,29 @@ class Qwen4SparseMoEBlock(nn.Module):
                     router.scores,
                     expert_indices,
                 )
-        shared = mx.sigmoid(self.shared_expert_gate(hidden_states)) * self.shared_expert(
-            hidden_states
-        )
+        shared = self._shared_output(hidden_states)
         return routed + shared
+
+    def _shared_output(self, hidden_states: mx.array) -> mx.array:
+        """Gated shared-expert output; one-row decode uses the stacked front."""
+        stack = (
+            _stacked_shared_front(self)
+            if hidden_states.size == hidden_states.shape[-1] and not self.training
+            else None
+        )
+        if stack is None:
+            return mx.sigmoid(self.shared_expert_gate(hidden_states)) * self.shared_expert(
+                hidden_states
+            )
+        import mlx_kquant as kq
+
+        weight, scales, offsets = stack
+        front = kq.quantized_matmul(hidden_states, weight, scales, "q6_k", transpose=True)
+        gate = front[..., offsets[0]:offsets[1]]
+        up = front[..., offsets[1]:offsets[2]]
+        shared_gate = front[..., offsets[2]:offsets[3]]
+        value = self.shared_expert.down_proj(_compiled_swiglu(gate, up))
+        return _compiled_gated_shared(shared_gate, value)
 
     def _pooled_forward(self, hidden_states, expert_indices, scores):
         """Supply Qwen math to the shared pooled execution schedule."""
@@ -490,6 +605,18 @@ class Qwen4SparseMoEBlock(nn.Module):
             return None if output is None else reduce(output, weights, indices)
 
         def pipelined(value, indices, weights, *, event_gate):
+            weighted = getattr(self.experts, "build_pipelined_weighted", None)
+            output = (
+                weighted(value, indices, weights, event_gate=event_gate)
+                if callable(weighted)
+                else None
+            )
+            if output is not None:
+                if output.shape != value.shape or output.dtype != value.dtype:
+                    raise ValueError("weighted routed executor returned an invalid output contract")
+                self.weighted_decode_calls += 1
+                self.weighted_decode_output_elements += int(output.size)
+                return output
             output = self.experts.build_pipelined(value, indices, event_gate=event_gate)
             return reduce(output, weights, indices)
 
@@ -498,9 +625,7 @@ class Qwen4SparseMoEBlock(nn.Module):
             hidden_states,
             expert_indices,
             scores,
-            shared=lambda value: (
-                mx.sigmoid(self.shared_expert_gate(value)) * self.shared_expert(value)
-            ),
+            shared=lambda value: self._shared_output(value),
             reduce=reduce,
             resident=resident,
             pipelined=pipelined,

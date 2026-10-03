@@ -19,6 +19,7 @@ reaches this module after the content already looked like an attempt.
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass
 
@@ -30,6 +31,11 @@ from moespresso.toolcalls.envelope import (
     envelope_from_object,
 )
 from moespresso.toolcalls.types import ToolCall, ToolCallParseError
+
+# Local serving flag: after every repair fails, return a structurally sound Qwen XML
+# call with untyped raw values rather than plain text. Off unless the environment
+# sets MOESPRESSO_TOOLCALL_UNTYPED_FALLBACK=1.
+_UNTYPED_FALLBACK = os.environ.get("MOESPRESSO_TOOLCALL_UNTYPED_FALLBACK") == "1"
 
 _FENCE_LINE_RE = re.compile(r"^```[A-Za-z0-9_-]*[ \t]*$\n?", re.MULTILINE)
 _FENCED_SEGMENT_RE = re.compile(r"```[A-Za-z0-9_-]*[ \t]*\n(.*?)```", re.DOTALL)
@@ -255,6 +261,18 @@ def repair_qwenxml_tool_calls(
             continue
         if calls:
             return calls
+    if _UNTYPED_FALLBACK and schemas:
+        # A structurally sound call whose value does not match its declared type
+        # (for example an empty array parameter) still reaches the client, with
+        # the raw text as the value. The client's own schema check then returns
+        # a tool error to the model instead of the turn ending as plain text.
+        try:
+            calls = qwenxml.parse_qwenxml_tool_calls(text, {})
+        except ToolCallParseError as e:
+            last_error = e
+        else:
+            if calls:
+                return calls
     raise ToolCallParseError(f"unrepairable tool-call text: {last_error}")
 
 

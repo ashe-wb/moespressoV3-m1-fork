@@ -26,8 +26,10 @@ from moespresso.runtime.qwen4.ple_contract import (
 
 
 _DEFAULT_MAX_OPEN_FILES = 128
-_PARALLEL_READ_MIN_RUNS = 1_024
-_READ_WORKERS = 4
+# One decode token reads about 16 scattered rows. Serial cold reads measured
+# 2.1 ms per token on a 32 GB M1 Max; one worker per row measured 0.7 ms.
+_PARALLEL_READ_MIN_RUNS = 2
+_READ_WORKERS = 16
 
 
 @dataclass(frozen=True)

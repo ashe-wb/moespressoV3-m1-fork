@@ -136,6 +136,36 @@ class LoadBatch:
         if first is not None:
             raise first
 
+    def job_count(self) -> int:
+        """Return how many calls are registered and not yet released by wait_prefix."""
+        with self._condition:
+            return len(self._jobs)
+
+    def wait_prefix(self, count: int) -> None:
+        """Join the oldest ``count`` calls, raise their first failure, then release them."""
+        with self._condition:
+            if not 0 <= count <= len(self._jobs):
+                raise ValueError("pooled load batch prefix is out of range")
+            jobs = self._jobs[:count]
+        first: BaseException | None = None
+        for job in jobs:
+            future = job.future
+            if future is None:
+                self._abort_and_drain(RuntimeError("pooled load prefix has an unsubmitted call"))
+            try:
+                future.result()
+            except BaseException as exc:
+                if first is None:
+                    first = exc
+                if not isinstance(exc, Exception):
+                    self._abort_and_drain(first)
+        if first is not None:
+            raise first
+        with self._condition:
+            if self._jobs[:count] != jobs:
+                raise RuntimeError("pooled load batch prefix changed while waiting")
+            del self._jobs[:count]
+
     def cancel_and_drain(self) -> None:
         """Prevent unstarted calls and wait until every already-active writer exits."""
 

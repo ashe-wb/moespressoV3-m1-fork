@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import math
+import os
 from typing import TYPE_CHECKING, Any, Protocol
 
 import mlx.core as mx
@@ -39,6 +40,10 @@ _QSA_STATE_SCHEMA = "qwen4_qsa_state_v1"
 _QSA_PREFIX_SUM_MIN_QUERIES = 64
 _QSA_TRUSTED_ALL_VALID_CAPABILITY = object()
 _QSA_DEFER_PENDING_FINITE_CAPABILITY = object()
+
+
+_FUSED_PREFILL_ATTENTION = os.environ.get("MOESPRESSO_QWEN4_FUSED_QSA_PREFILL", "1") != "0"
+_FUSED_DECODE_ATTENTION = os.environ.get("MOESPRESSO_QWEN4_FUSED_QSA_DECODE", "1") != "0"
 
 
 def _qsa_project_rope_operation():
@@ -2019,7 +2024,60 @@ class Qwen4QSAAdapter(nn.Module):
             def attend_rows(
                 query_values: mx.array,
                 selected_indices: mx.array,
+                *,
+                ascending_unique: bool = False,
             ) -> mx.array:
+                # Prefill reads selected rows from a dense BF16 bank: the
+                # prepared prior-plus-segment rows, or the segment's own rows
+                # when no prior state exists.
+                bank = None
+                if prepared_rows is not None:
+                    bank = (prepared_rows.keys, prepared_rows.values)
+                elif working_state is None and width > 1:
+                    bank = (segment_keys, segment_values)
+                if bank is not None and _FUSED_PREFILL_ATTENTION:
+                    from moespresso.runtime.qwen4.qsa_prefill_attention import (
+                        fused_qsa_prefill_attention,
+                        fused_qsa_supported,
+                    )
+
+                    if fused_qsa_supported(query_values, bank[0]):
+                        self.fused_prefill_attention_calls = (
+                            getattr(self, "fused_prefill_attention_calls", 0) + 1
+                        )
+                        return fused_qsa_prefill_attention(
+                            query_values,
+                            bank[0],
+                            bank[1],
+                            selected_indices,
+                            scale=module.head_dim**-0.5,
+                        )
+                if (
+                    _FUSED_DECODE_ATTENTION
+                    and prepared_rows is None
+                    and masks_certified
+                    and token_count == 1
+                    and query_values.shape == (1, 1, 24, 256)
+                    and query_values.dtype == mx.bfloat16
+                ):
+                    attend_fused = getattr(
+                        self.state_backend,
+                        "_attend_selected_rows_deferred_finite",
+                        None,
+                    )
+                    if callable(attend_fused):
+                        fused = attend_fused(
+                            working_state,
+                            segment_keys,
+                            segment_values,
+                            selected_indices,
+                            query_values,
+                            scale=module.head_dim**-0.5,
+                            capability=_QSA_DEFER_PENDING_FINITE_CAPABILITY,
+                            ascending_unique=ascending_unique,
+                        )
+                        if fused is not None:
+                            return fused
                 gathered_keys, gathered_values, selected_valid = gather_rows(selected_indices)
                 return qsa_attention_from_selected_rows(
                     query_values,
@@ -2080,6 +2138,16 @@ class Qwen4QSAAdapter(nn.Module):
                     index_preparation.compressed_keys,
                 )
                 native_eligible = native_selector_is_eligible(scores, query_layout)
+                if native_eligible and _FUSED_DECODE_ATTENTION and prepared_rows is None:
+                    # Selection alone, then fused attention reads the selected
+                    # rows from storage instead of a gathered copy.
+                    # The native selector returns ascending physical rows
+                    # without repeats, padded with negative ids.
+                    return attend_rows(
+                        query_values,
+                        select_rows_from_scores(scores, query_layout),
+                        ascending_unique=True,
+                    )
                 select_gather = getattr(
                     self.state_backend,
                     "_select_and_gather_rows_deferred_finite",

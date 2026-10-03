@@ -32,6 +32,8 @@ class PooledDecodeSession:
         self._gate_bound = False
         self._gate_mod: Any | None = None
         self._native_max: int | None = None
+        self._defer_token_drain = False
+        self._token_marks: list[int] = []
 
     @property
     def active(self) -> bool:
@@ -171,6 +173,50 @@ class PooledDecodeSession:
 
         return batch.submit(lambda: call(lambda: batch.cancelled))
 
+    @contextmanager
+    def deferred_token_drain(self) -> Iterator[None]:
+        """Record the deepest layer's worker watermark instead of joining it.
+
+        The caller must drain each recorded token with ``drain_token`` before
+        committing that token's state.
+        """
+        self.require_current_request()
+        with self._lock:
+            previous = self._defer_token_drain
+            self._defer_token_drain = True
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._defer_token_drain = previous
+
+    @property
+    def defers_token_drain(self) -> bool:
+        with self._lock:
+            return self._defer_token_drain
+
+    def mark_token_boundary(self) -> None:
+        """Record the submitted-writer watermark at the end of one deferred token."""
+        self.require_current_request()
+        with self._lock:
+            batch = self._batch
+            count = 0 if batch is None else batch.job_count()
+            self._token_marks.append(count)
+
+    def drain_token(self) -> None:
+        """Join the oldest deferred token's writers and surface their failures."""
+        self.require_current_request()
+        with self._lock:
+            if not self._token_marks:
+                raise RuntimeError("pooled decode has no deferred token to drain")
+            count = self._token_marks[0]
+            batch = self._batch
+        if batch is not None and count:
+            batch.wait_prefix(count)
+        with self._lock:
+            self._token_marks.pop(0)
+            self._token_marks = [max(0, mark - count) for mark in self._token_marks]
+
     def remember(self, root: Any) -> None:
         """Retain the newest graph root until request cleanup synchronizes it."""
         self.require_current_request()
@@ -198,6 +244,7 @@ class PooledDecodeSession:
                 self._batch = None
                 self._executor = None
                 self._publication_pending = False
+                self._token_marks = [0 for _ in self._token_marks]
         return None
 
     def drain(self) -> None:
@@ -246,6 +293,7 @@ class PooledDecodeSession:
 
     def _clear_work(self) -> None:
         with self._lock:
+            self._token_marks = []
             self._batch = None
             self._executor = None
             self._publication_pending = False

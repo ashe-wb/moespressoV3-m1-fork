@@ -398,6 +398,8 @@ def test_certified_qsa_step_binds_masks_frontiers_and_backend_proof(
 def test_certified_qsa_step_uses_native_selector_when_eligible(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The gathered-row seam is the fallback beneath fused decode attention.
+    monkeypatch.setattr(qsa_runtime, "_FUSED_DECODE_ATTENTION", False)
     module, _ = _small_qsa()
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
     valid = mx.ones((1, 1), dtype=mx.bool_)
@@ -459,6 +461,8 @@ def test_certified_qsa_step_uses_native_selector_when_eligible(
 def test_certified_qsa_step_combines_native_selection_and_gather(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    # The gathered-row seam is the fallback beneath fused decode attention.
+    monkeypatch.setattr(qsa_runtime, "_FUSED_DECODE_ATTENTION", False)
     module, _ = _small_qsa()
     hidden = mx.array([[[1.0, 2.0]]], dtype=mx.float32)
     valid = mx.ones((1, 1), dtype=mx.bool_)

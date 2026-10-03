@@ -35,6 +35,28 @@ T = DSML_TOKEN
 
 # --- qwen xml ------------------------------------------------------------------
 
+_EDIT_SCHEMA = {"edit": {"type": "object", "properties": {
+    "path": {"type": "string"},
+    "edits": {"type": "array", "items": {"type": "object"}},
+}}}
+_EMPTY_ARRAY_EDIT = (
+    "<tool_call>\n<function=edit>\n<parameter=edits> </parameter>\n</function>\n</tool_call>"
+)
+
+
+def test_qwenxml_type_mismatch_stays_unrepairable_by_default():
+    with pytest.raises(ToolCallParseError):
+        repair_qwenxml_tool_calls(_EMPTY_ARRAY_EDIT, _EDIT_SCHEMA)
+
+
+def test_qwenxml_untyped_fallback_returns_the_call_with_raw_values(monkeypatch):
+    import moespresso.toolcalls.repair as repair
+
+    monkeypatch.setattr(repair, "_UNTYPED_FALLBACK", True)
+    calls = repair_qwenxml_tool_calls(_EMPTY_ARRAY_EDIT, _EDIT_SCHEMA)
+    assert [(call.name, call.arguments) for call in calls] == [("edit", {"edits": " "})]
+
+
 def test_qwenxml_fenced_truncated_block_is_salvaged():
     # A fenced, truncated call needs two transformations: drop the fence
     # lines, then close the dangling elements.

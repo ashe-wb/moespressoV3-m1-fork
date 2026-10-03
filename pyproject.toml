@@ -6,7 +6,7 @@ readme = "README.md"
 license = "MIT OR Apache-2.0"
 license-files = ["LICENSE-MIT", "LICENSE-APACHE-2.0", "THIRD-PARTY-NOTICES"]
 requires-python = ">=3.11"
-authors = [{ name = "Riccardo Chiumiento" }]
+authors = [{ name = "Riccardo Chiumiento" }, { name = "ashe-wb" }]
 keywords = [
     "apple-silicon",
     "inference",
@@ -37,10 +37,10 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/steadfastgaze/MoEspresso"
-Repository = "https://github.com/steadfastgaze/MoEspresso"
-Documentation = "https://github.com/steadfastgaze/MoEspresso#readme"
-Issues = "https://github.com/steadfastgaze/MoEspresso/issues"
+Homepage = "https://github.com/ashe-wb/moespressoV3-m1-fork"
+Repository = "https://github.com/ashe-wb/moespressoV3-m1-fork"
+Documentation = "https://github.com/ashe-wb/moespressoV3-m1-fork#readme"
+Issues = "https://github.com/ashe-wb/moespressoV3-m1-fork/issues"
 
 [project.optional-dependencies]
 # Optional build/conversion helper dependency. This is intentionally not part of

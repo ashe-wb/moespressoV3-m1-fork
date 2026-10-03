@@ -149,6 +149,7 @@ class BundleRowCache:
         self._inflight: dict[int, threading.Event] = {}
         self.total_preads = 0
         self.total_cached_takes = 0
+        self.total_prefetched_rows = 0
 
     def take(self, expert: int) -> memoryview:
         """The expert's bundle row bytes (read-only use; do not mutate)."""
@@ -172,27 +173,117 @@ class BundleRowCache:
             event.wait()  # another thread is loading it; then retry
 
         try:
-            br = self.index.locate_row(layer=self.layer, expert=expert)
-            buf = bytearray(br.nbytes)
-            pread_view_cached(
-                memoryview(buf),
-                self.package_dir / br.shard,
-                file_offset=br.offset,
-                nbytes=br.nbytes,
-            )
+            buf = self._read_row(expert)
             with self._lock:
                 self.total_preads += 1
                 # the loader's own take counts as the first consumption
                 if self.consumers > 1:
-                    self._rows[expert] = [buf, 1]
-                    self._rows.move_to_end(expert)
-                    while len(self._rows) > self.max_rows:
-                        self._rows.popitem(last=False)
+                    self._publish_locked(expert, buf, takes=1)
             return memoryview(buf)
         finally:
             with self._lock:
                 self._inflight.pop(expert, None)
             event.set()
+
+    def prefetch(self, experts, executor) -> list:
+        """Start concurrent reads of absent rows and return their futures.
+
+        `take` reads one row at a time, so projection pools that walk several
+        missed experts in order pay one SSD latency per expert. Prefetched
+        reads share `take`'s in-flight markers: a pool that asks for a row
+        before it lands waits for this read instead of issuing its own. A
+        failed read publishes nothing, and the next `take` reads the row
+        itself and surfaces the error. Callers join the futures before
+        reporting the cache quiescent.
+        """
+        claimed: list[tuple[int, threading.Event]] = []
+        with self._lock:
+            for expert in experts:
+                expert = int(expert)
+                if expert in self._rows or expert in self._inflight:
+                    continue
+                event = threading.Event()
+                self._inflight[expert] = event
+                claimed.append((expert, event))
+        futures = []
+        for position, (expert, event) in enumerate(claimed):
+            try:
+                futures.append(executor.submit(self._prefetch_row, expert, event))
+            except BaseException:
+                with self._lock:
+                    for unsubmitted, unsubmitted_event in claimed[position:]:
+                        self._inflight.pop(unsubmitted, None)
+                        unsubmitted_event.set()
+                raise
+        return futures
+
+    def stream_prefetch(
+        self,
+        experts,
+        executor,
+        *,
+        window: int,
+        consumed,
+        stop: threading.Event,
+    ) -> list:
+        """Keep up to ``window`` rows read ahead of ordered consumers.
+
+        Consumers take rows in ``experts`` order. A row is submitted only while
+        fewer than ``window`` rows are cached or in flight, so read-ahead never
+        exceeds the cache window and cannot evict an unconsumed row. Rows the
+        consumers have already loaded (``consumed(expert)``) are skipped.
+        Returns the submitted read futures.
+        """
+        if not 0 < window < self.max_rows:
+            raise ValueError("stream prefetch window must be below the row cache window")
+        futures: list = []
+        for expert in experts:
+            while not stop.is_set():
+                if consumed(expert):
+                    break
+                with self._lock:
+                    queued = expert in self._rows or expert in self._inflight
+                    pending = len(self._rows) + len(self._inflight)
+                if queued or pending < window:
+                    break
+                time.sleep(0.0002)
+            if stop.is_set():
+                break
+            if not consumed(expert):
+                futures.extend(self.prefetch([expert], executor))
+        return futures
+
+    def _prefetch_row(self, expert: int, event: threading.Event) -> None:
+        try:
+            buf = self._read_row(expert)
+        except Exception:
+            return
+        else:
+            with self._lock:
+                self.total_preads += 1
+                self.total_prefetched_rows += 1
+                self._publish_locked(expert, buf, takes=0)
+        finally:
+            with self._lock:
+                self._inflight.pop(expert, None)
+            event.set()
+
+    def _read_row(self, expert: int) -> bytearray:
+        br = self.index.locate_row(layer=self.layer, expert=expert)
+        buf = bytearray(br.nbytes)
+        pread_view_cached(
+            memoryview(buf),
+            self.package_dir / br.shard,
+            file_offset=br.offset,
+            nbytes=br.nbytes,
+        )
+        return buf
+
+    def _publish_locked(self, expert: int, buf: bytearray, *, takes: int) -> None:
+        self._rows[expert] = [buf, takes]
+        self._rows.move_to_end(expert)
+        while len(self._rows) > self.max_rows:
+            self._rows.popitem(last=False)
 
     def discard(self, expert: int) -> None:
         """Drop a partially consumed row after a coordinated-load failure."""
@@ -1202,8 +1293,10 @@ class ExpertSlotPool:
         graph, unlike remap_loaded's per-call host materialization)."""
         if self._slot_table is None or self._slot_table_dirty:
             host = np.full(self.num_experts, self._slot_sentinel, dtype=np.uint32)
-            for expert, slot in self._slot_of.items():
-                host[expert] = slot
+            if self._slot_of:
+                count = len(self._slot_of)
+                host[np.fromiter(self._slot_of.keys(), dtype=np.int64, count=count)] = (
+                    np.fromiter(self._slot_of.values(), dtype=np.uint32, count=count))
             self._slot_table = mx.array(host)
             self._slot_table_identity = (
                 len(self._slot_of) == self.num_experts

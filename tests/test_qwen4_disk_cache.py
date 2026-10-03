@@ -12,6 +12,8 @@ from moespresso.runtime.qwen4.generation import QWEN4_GENERATION_ADAPTER, Qwen4R
 from test_qwen4_cache_snapshot import model
 from test_qwen4_generation import _Tokenizer
 from test_qwen4_kvarn_snapshot import same_arrays
+from types import SimpleNamespace
+from moespresso.runtime.qwen4.disk_cache import _checkpoint_stride
 
 
 def generator(store=None, memory=None):
@@ -248,3 +250,21 @@ def test_qwen_snapshot_exceeding_disk_budget_does_not_evict_or_fail_request(tmp_
         run.close()
         cold.close()
         store.close()
+
+
+@pytest.mark.parametrize(
+    "bounded, step, stride, expected",
+    [
+        (False, 4096, 1024, 1024),
+        (True, 4096, 1024, 4096),
+        (True, 3000, 1024, 3072),
+        (True, 512, 1024, 1024),
+        (True, None, 1024, 1024),
+        (True, True, 1024, 1024),
+    ],
+)
+def test_bounded_checkpoint_stride_follows_prefill_step(bounded, step, stride, expected):
+    model = SimpleNamespace(_moespresso_pooled_decode_bounded=bounded)
+    if step is not None:
+        model._moespresso_qwen4_prefill_step_size = step
+    assert _checkpoint_stride(model, stride) == expected

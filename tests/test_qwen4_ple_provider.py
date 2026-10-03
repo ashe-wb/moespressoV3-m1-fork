@@ -354,6 +354,7 @@ def test_parallel_lookup_preserves_duplicates_and_keeps_mlx_on_caller(
 ) -> None:
     provider = Qwen4PLEDirectRowProvider(_layout(tmp_path))
     ids = mx.array([[10, 0, 4, 2, 8, 6, 4]], dtype=mx.int64)
+    monkeypatch.setattr(provider_module, "_PARALLEL_READ_MIN_RUNS", 1 << 20)
     expected = provider.lookup(ids)
     mx.eval(expected)
     assert provider._read_executor is None

@@ -561,6 +561,10 @@ class Qwen4MutableKVarNStorage:
             raise ValueError("mutable Qwen KVarN frontier belongs to another storage")
         if frontier.lineage != self._lineage:
             raise ValueError("mutable Qwen KVarN frontier belongs to an expired lineage")
+        # Frontier fields are immutable; their geometry was checked against this
+        # storage's fixed limits when first validated.
+        if frontier.__dict__.get("_geometry_validated_for") is self._storage_identity:
+            return
         integer_fields = {
             "frontier": frontier.frontier,
             "body_frontier": frontier.body_frontier,
@@ -598,6 +602,7 @@ class Qwen4MutableKVarNStorage:
             or frontier.logical_nbytes != expected_nbytes
         ):
             raise ValueError("mutable Qwen KVarN frontier geometry is incompatible")
+        object.__setattr__(frontier, "_geometry_validated_for", self._storage_identity)
 
     def _require_active_frontier(self, frontier: Qwen4MutableKVarNFrontier) -> None:
         self._validate_frontier_identity(frontier)
@@ -985,6 +990,64 @@ class Qwen4MutableKVarNStorage:
             selected_indices,
             check_finite=False,
         )
+
+    def _attend_selected_rows_with_pending_deferred_finite(
+        self,
+        pending_keys: mx.array,
+        pending_values: mx.array,
+        selected_indices: mx.array,
+        queries: mx.array,
+        *,
+        scale: float,
+        ascending_unique: bool = False,
+    ) -> mx.array | None:
+        """Attend one decode query over its selection without gathering rows.
+
+        Applies the checks of the deferred-finite gather and returns None
+        wherever the fused gather would not run. ascending_unique marks a
+        selection already in ascending physical order without repeats, whose
+        normalization is the identity apart from its negative padding.
+        """
+        self.validate()
+        next_frontier = self._validate_pending_geometry(pending_keys, pending_values)
+        if selected_indices.ndim != 3 or selected_indices.shape[0] != 1:
+            raise ValueError("Qwen KVarN selected rows require shape [1, queries, width]")
+        if (
+            pending_keys.shape[2] != 1
+            or self.frontier < QWEN38_KVARN_EXACT_SINK
+            or self.record_capacity <= 0
+            or selected_indices.shape[1] != 1
+        ):
+            return None
+        if next_frontier > self.max_context_tokens:
+            raise ValueError("pending K/V rows exceed mutable Qwen KVarN capacity")
+        from moespresso.runtime.qwen4.qsa_decode_attention import qsa_kvarn_decode_attention
+
+        self.counters.deferred_pending_value_checks += 1
+        if ascending_unique:
+            normalized = selected_indices
+            valid = (selected_indices >= 0) & (selected_indices < next_frontier)
+        else:
+            normalized, valid = qsa_normalize_selected_rows(selected_indices, next_frontier)
+        output = qsa_kvarn_decode_attention(
+            queries,
+            self.packed_records[: max(1, self.record_count)],
+            self.exact_sink_keys,
+            self.exact_sink_values,
+            self.exact_tail_keys,
+            self.exact_tail_values,
+            pending_keys,
+            pending_values,
+            normalized,
+            valid,
+            frontier=self.frontier,
+            record_count=self.record_count,
+            scale=scale,
+        )
+        self.counters.gather_calls += 1
+        self.counters.pending_gather_calls += 1
+        self.counters.gather_lanes += int(selected_indices.size)
+        return output
 
     def _gather_selected_rows_with_pending(
         self,

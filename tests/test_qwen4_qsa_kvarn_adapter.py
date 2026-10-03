@@ -896,6 +896,10 @@ def test_mutable_backend_restores_and_commits_process_local_frontiers() -> None:
 def test_mutable_adapter_materializes_once_and_capability_fallback_restores_tiled_gathers(
     monkeypatch,
 ) -> None:
+    # This test pins the gather seam; fused attention has its own tolerance test.
+    import moespresso.runtime.qwen4.qsa as qsa_module
+
+    monkeypatch.setattr(qsa_module, "_FUSED_PREFILL_ATTENTION", False)
     module = _module(seed=711)
     candidate_backend = Qwen4MutableKVarNQSAStateBackend(
         module,

@@ -18,52 +18,68 @@ from moespresso.runtime.qwen4.cache_routing_config import (
 )
 
 _HEADER = r"""
-inline bool route_better(float a, uint ai, float b, uint bi) {
-    bool an = metal::isnan(a), bn = metal::isnan(b);
-    return (an && !bn) || (an == bn &&
-        ((an && ai > bi) || (!an && (a > b || (a == b && ai > bi)))));
+// Order-preserving rank of a routing key: every NaN ranks highest, zeros of
+// either sign are equal, and larger values rank higher. With the expert id as
+// the low word, a larger (rank, id) pair is the better route: the larger key,
+// or the larger id between equal keys or two NaNs.
+inline uint route_rank(float value) {
+    if (metal::isnan(value)) return 0xffffffffu;
+    uint bits = as_type<uint>(value == 0.0f ? 0.0f : value);
+    return (bits & 0x80000000u) ? ~bits : (bits | 0x80000000u);
 }
 
+// Largest (rank, id) pair across a simdgroup; exhausted lanes pass (0, 0).
+inline uint2 route_simd_max(uint rank, uint id) {
+    uint top = simd_max(rank);
+    return uint2(top, simd_max(rank == top ? id : 0u));
+}
+
+// Top ten routes of 512 keys, best first. Each simdgroup takes
+// its own ten with SIMD reductions only, then one simdgroup merges the four
+// sorted lists.
 inline void route_top10(threadgroup float* keys, threadgroup uint* chosen,
-                        threadgroup float* partial_values,
-                        threadgroup uint* partial_ids,
+                        threadgroup uint* list_ranks, threadgroup uint* list_ids,
                         uint tid, uint sg, uint lane) {
-    float values[4];
-    bool alive[4] = {true, true, true, true};
-    for (uint j = 0; j < 4; ++j) values[j] = keys[tid * 4 + j];
-    for (uint route = 0; route < 10; ++route) {
-        float best = -INFINITY;
-        uint best_id = 0;
-        bool found = false;
-        for (uint j = 0; j < 4; ++j) {
-            uint id = tid * 4 + j;
-            if (alive[j] && (!found || route_better(values[j], id, best, best_id))) {
-                best = values[j]; best_id = id; found = true;
+    uint ranks[4], ids[4];
+    for (uint j = 0; j < 4; ++j) {
+        ids[j] = tid * 4 + j;
+        ranks[j] = route_rank(keys[ids[j]]);
+    }
+    // Sort the thread's four pairs best first.
+    for (uint a = 0; a < 3; ++a) {
+        for (uint b = 0; b < 3 - a; ++b) {
+            bool swap = ranks[b + 1] > ranks[b]
+                || (ranks[b + 1] == ranks[b] && ids[b + 1] > ids[b]);
+            if (swap) {
+                uint r = ranks[b]; ranks[b] = ranks[b + 1]; ranks[b + 1] = r;
+                uint i = ids[b]; ids[b] = ids[b + 1]; ids[b + 1] = i;
             }
         }
-        uint has_nan = simd_max(uint(found && metal::isnan(best)));
-        float value = simd_max(found && !metal::isnan(best) ? best : -INFINITY);
-        uint id = simd_max(found && (has_nan ? metal::isnan(best) : best == value)
-                          ? best_id : 0u);
+    }
+    uint head = 0;
+    for (uint route = 0; route < 10; ++route) {
+        uint rank = head < 4 ? ranks[head] : 0u;
+        uint id = head < 4 ? ids[head] : 0u;
+        uint2 best = route_simd_max(rank, id);
+        if (head < 4 && rank == best.x && id == best.y) ++head;
         if (lane == 0) {
-            partial_values[sg] = keys[id];
-            partial_ids[sg] = id;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (sg == 0) {
-            bool valid = lane < 4;
-            float part = valid ? partial_values[lane] : -INFINITY;
-            uint nan_group = simd_max(uint(valid && metal::isnan(part)));
-            float winner = simd_max(valid && !metal::isnan(part) ? part : -INFINITY);
-            uint winner_id = simd_max(valid && (nan_group ? metal::isnan(part) : part == winner)
-                                     ? partial_ids[lane] : 0u);
-            if (lane == 0) chosen[route] = winner_id;
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-        for (uint j = 0; j < 4; ++j) {
-            if (tid * 4 + j == chosen[route]) alive[j] = false;
+            list_ranks[sg * 10 + route] = best.x;
+            list_ids[sg * 10 + route] = best.y;
         }
     }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (sg == 0) {
+        uint position = 0;
+        for (uint route = 0; route < 10; ++route) {
+            bool live = lane < 4 && position < 10;
+            uint rank = live ? list_ranks[lane * 10 + position] : 0u;
+            uint id = live ? list_ids[lane * 10 + position] : 0u;
+            uint2 best = route_simd_max(rank, id);
+            if (live && rank == best.x && id == best.y) ++position;
+            if (lane == 0) chosen[route] = best.y;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
 }
 
 inline void route_sort(threadgroup float* probabilities,
@@ -93,8 +109,8 @@ _SOURCE = r"""
     uint row = threadgroup_position_in_grid.x;
     threadgroup float probabilities[512], keys[512];
     threadgroup float maxima[32], sums[32];
-    threadgroup float partial_values[4];
-    threadgroup uint partial_ids[4];
+    threadgroup uint list_ranks[40];
+    threadgroup uint list_ids[40];
     threadgroup uint invalid[4];
     threadgroup uint chosen[10], original[10], ranked[10];
     threadgroup uint apply_bias;
@@ -139,7 +155,7 @@ _SOURCE = r"""
         keys[id] = probabilities[id];
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    route_top10(keys, chosen, partial_values, partial_ids, tid, sg, lane);
+    route_top10(keys, chosen, list_ranks, list_ids, tid, sg, lane);
     route_sort(probabilities, chosen, original, tid);
 
     if (tid == 0) {
@@ -163,7 +179,7 @@ _SOURCE = r"""
                 : probabilities[id] * (hot ? cache_factor[0] : 1.0f);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        route_top10(keys, chosen, partial_values, partial_ids, tid, sg, lane);
+        route_top10(keys, chosen, list_ranks, list_ids, tid, sg, lane);
         route_sort(probabilities, chosen, ranked, tid);
     } else {
         if (tid < 10) ranked[tid] = original[tid];
@@ -196,6 +212,41 @@ def _kernel():
         input_names=["logits", "gate_slots", "up_slots", "down_slots", "cache_factor", "protected_routes"],
         output_names=["output_ids", "output_scores", "changed"],
         header=_HEADER, source=_SOURCE,
+    )
+
+
+@cache
+def _resident_only_kernel():
+    old = ": probabilities[id] * (hot ? cache_factor[0] : 1.0f);"
+    if _SOURCE.count(old) != 1:
+        raise RuntimeError("cache-prior selection source changed")
+    source = _SOURCE.replace(old, ": (hot ? probabilities[id] : -INFINITY);")
+    source += "    if (tid < 10) original_ids[row * 10 + tid] = original[tid];\n"
+    return mx.fast.metal_kernel(
+        name="moespresso_resident_only_router",
+        input_names=["logits", "gate_slots", "up_slots", "down_slots", "cache_factor", "protected_routes"],
+        output_names=["output_ids", "output_scores", "changed", "original_ids"],
+        header=_HEADER, source=source,
+    )
+
+
+def resident_only_route(logits, slot_maps):
+    """Select the ten strongest experts resident in all three maps.
+
+    Contribution weights are the original probabilities normalized over the
+    selection, as in ``cache_prior_route``. Also returns the original top ten
+    in descending probability. Requires at least ten experts resident in every
+    map and finite logits; otherwise nonresident routes can remain selected.
+    """
+    if (logits.size != 512 or logits.dtype != mx.bfloat16 or len(slot_maps) != 3
+            or any(x.shape != (512,) or x.dtype != mx.uint32 for x in slot_maps)):
+        raise ValueError("requires one BF16 router row and three uint32 expert-slot maps")
+    shape = (*logits.shape[:-1], 10)
+    return _resident_only_kernel()(
+        inputs=[mx.contiguous(logits), *slot_maps, _bonus(math.log(2.0)), _protected_routes(0)],
+        output_shapes=[shape, shape, (1,), shape],
+        output_dtypes=[mx.uint32, mx.bfloat16, mx.uint32, mx.uint32],
+        grid=(128, 1, 1), threadgroup=(128, 1, 1),
     )
 
 

@@ -439,3 +439,49 @@ def test_poisoned_active_session_rejects_resident_work_before_math(
     allow_sync[0] = True
     session.abort_and_drain()
     assert not session.active
+
+
+def test_deferred_last_layer_records_a_boundary_instead_of_joining(
+    monkeypatch,
+    schedule_runtime,
+) -> None:
+    switch = _Switch()
+    release, done = threading.Event(), threading.Event()
+
+    def install(sequence, width, gate, *, cancelled) -> None:
+        assert release.wait(5)
+        done.set()
+
+    gate = SimpleNamespace(signaled_value=lambda: 0, signal_event=lambda sequence: None)
+    switch.ring_install = install
+    monkeypatch.setattr(pooled, "_gate_module", lambda: gate)
+    monkeypatch.setattr(pooled, "_kick_eval", lambda root: None)
+    monkeypatch.setattr(pooled_moe, "_synchronize_root", lambda root: None)
+    session = pooled_moe._switch_session(switch)
+
+    with session.request(object(), synchronize=lambda root: None):
+        with session.deferred_token_drain():
+            _run(switch, last=True)
+        assert not done.is_set()
+        release.set()
+        session.drain_token()
+        assert done.is_set()
+
+
+def test_last_layer_without_deferral_still_joins(monkeypatch, schedule_runtime) -> None:
+    switch = _Switch()
+    done = threading.Event()
+
+    def install(sequence, width, gate, *, cancelled) -> None:
+        done.set()
+
+    gate = SimpleNamespace(signaled_value=lambda: 0, signal_event=lambda sequence: None)
+    switch.ring_install = install
+    monkeypatch.setattr(pooled, "_gate_module", lambda: gate)
+    monkeypatch.setattr(pooled, "_kick_eval", lambda root: None)
+    monkeypatch.setattr(pooled_moe, "_synchronize_root", lambda root: None)
+    session = pooled_moe._switch_session(switch)
+
+    with session.request(object(), synchronize=lambda root: None):
+        _run(switch, last=True)
+        assert done.is_set()

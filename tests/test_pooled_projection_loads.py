@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from types import SimpleNamespace
 import threading
 import time
@@ -41,6 +42,8 @@ def _switch(pools: list[_Pool]) -> SimpleNamespace:
         _touch_projection_pools_if_resident=lambda active: False,
         _projection_pools=lambda: pools,
         _drain_stale_prefetch_ticket=lambda: pytest.fail("unexpected prefetch drain"),
+        _prefetch_missing_rows=lambda active, missing_pools: [],
+        _streamed_row_reads=lambda active, pools: nullcontext(),
         overlap_ticket_mismatch_calls=0,
         projection_load_wait_calls=0,
         projection_load_parallel_calls=0,

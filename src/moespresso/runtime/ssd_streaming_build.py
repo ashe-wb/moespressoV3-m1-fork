@@ -839,6 +839,7 @@ def ssd_streaming_stats(model) -> dict:
     hc_fused_post_decode_calls = 0
     projection_load_wait_calls = projection_no_miss_calls = 0
     projection_load_parallel_calls = 0
+    projection_row_prefetch_calls = 0
     projection_load_wait_seconds = 0.0
     overlap_load_started_calls = overlap_load_wait_calls = 0
     overlap_load_wait_seconds = overlap_load_total_seconds = 0.0
@@ -967,6 +968,7 @@ def ssd_streaming_stats(model) -> dict:
         projection_load_wait_calls += switch.projection_load_wait_calls
         projection_no_miss_calls += switch.projection_no_miss_calls
         projection_load_parallel_calls += switch.projection_load_parallel_calls
+        projection_row_prefetch_calls += int(getattr(switch, "projection_row_prefetch_calls", 0))
         projection_load_wait_seconds += switch.projection_load_wait_seconds
         overlap_load_started_calls += switch.overlap_load_started_calls
         overlap_load_wait_calls += switch.overlap_load_wait_calls
@@ -1236,6 +1238,7 @@ def ssd_streaming_stats(model) -> dict:
         "projection_load_wait_calls": projection_load_wait_calls,
         "projection_no_miss_calls": projection_no_miss_calls,
         "projection_load_parallel_calls": projection_load_parallel_calls,
+        "projection_row_prefetch_calls": projection_row_prefetch_calls,
         "projection_load_wait_seconds": projection_load_wait_seconds,
         "overlap_load_started_calls": overlap_load_started_calls,
         "overlap_load_wait_calls": overlap_load_wait_calls,
@@ -1739,11 +1742,46 @@ def seed_expert_residency(model, package_dir: str | Path) -> dict:
         return info
     package_dir = Path(package_dir)
     path = package_dir / HOTLIST_NAME
+    # Full-capacity layers load every expert in ascending order first, so their
+    # slots equal expert ids and decode takes the full-resident path from the
+    # first token. The hotlist then seeds the bounded layers.
+    info["seeded"] = seed_full_capacity_layers(model) if prewarm != "none" else 0
     if path.exists():
-        info["seeded"] = load_expert_hotlist(model, path)
+        info["seeded"] += load_expert_hotlist(model, path)
         info["source"] = "package"
         info["path"] = str(path)
     return info
+
+
+def seed_full_capacity_layers(model) -> int:
+    """Load every expert of each layer whose pools can hold the full expert set."""
+    total_seeded = 0
+    for layer in _layers(model):
+        switch = _pooled_switch_for_layer(layer)
+        if not isinstance(switch, PooledSwitchGLU):
+            continue
+        pools = list(_unique_projection_pools_for_switch(switch))
+        num_experts = pools[0].num_experts
+        if any(pool.num_experts != num_experts or pool.capacity < num_experts for pool in pools):
+            continue
+        total_seeded += _seed_layer_experts(pools, num_experts)
+    return total_seeded
+
+
+def _seed_layer_experts(pools, num_experts: int) -> int:
+    before = sum(len(pool.resident_ids()) for pool in pools)
+    row_cache = pools[0].row_cache
+    chunk = int(getattr(row_cache, "max_rows", 32) or 32)
+    chunk = max(1, min(chunk, num_experts))
+    for start in range(0, num_experts, chunk):
+        experts = list(range(start, min(start + chunk, num_experts)))
+        # Keep gate/up/down for a row-cache window adjacent: this preserves
+        # one bundle-row pread per expert instead of one pread per
+        # projection after the cache evicts earlier rows.
+        for pool in pools:
+            pool.ensure(experts)
+    after = sum(len(pool.resident_ids()) for pool in pools)
+    return max(0, after - before)
 
 
 def seed_all_expert_residency(model) -> int:
@@ -1772,19 +1810,7 @@ def seed_all_expert_residency(model) -> int:
                     f"{num_experts}, got {pool.capacity}"
                 )
 
-        before = sum(len(pool.resident_ids()) for pool in pools)
-        row_cache = pools[0].row_cache
-        chunk = int(getattr(row_cache, "max_rows", 32) or 32)
-        chunk = max(1, min(chunk, num_experts))
-        for start in range(0, num_experts, chunk):
-            experts = list(range(start, min(start + chunk, num_experts)))
-            # Keep gate/up/down for a row-cache window adjacent: this preserves
-            # one bundle-row pread per expert instead of one pread per
-            # projection after the cache evicts earlier rows.
-            for pool in pools:
-                pool.ensure(experts)
-        after = sum(len(pool.resident_ids()) for pool in pools)
-        total_seeded += max(0, after - before)
+        total_seeded += _seed_layer_experts(pools, num_experts)
     return total_seeded
 
 

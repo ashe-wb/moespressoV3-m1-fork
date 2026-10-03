@@ -1268,6 +1268,10 @@ def main(
                         help="Set the streamed runtime's startup capacity-planner "
                              "ceiling (GB). This selects expert-pool geometry and "
                              "can simulate a smaller pool; it is not an RSS cap.")
+    parser.add_argument("--expert-capacity-profile", type=Path, default=None,
+                        help="Qwen4 bounded pools: redistribute the planner's expert "
+                             "slots across layers in the proportions of this "
+                             "package-bound JSON profile. Total pool memory is unchanged.")
     add_runtime_limit_arguments(parser)
     add_cache_routing_argument(parser)
     parser.add_argument("--prompt", default="Hello", help="Prompt to generate from")
@@ -1306,6 +1310,11 @@ def main(
     if args.max_memory_gb is not None:
         import os as _os_cap
         _os_cap.environ["MOESPRESSO_SSD_MAX_MEMORY_GB"] = str(args.max_memory_gb)
+    if args.expert_capacity_profile is not None:
+        import os as _os_profile
+        _os_profile.environ["MOESPRESSO_QWEN4_CAPACITY_PROFILE"] = str(
+            args.expert_capacity_profile.expanduser().resolve()
+        )
 
     pkg = Path(args.package_dir)
     preflight_manifest = _preflight_manifest_for_cli(pkg)

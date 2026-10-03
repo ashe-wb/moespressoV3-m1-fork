@@ -221,9 +221,14 @@ def run_pooled_moe(
         kick(result if gate is not None else token)
         session.remember(result)
         if last:
-            join()
-            if gate is None:
-                kick(result)
+            if gate is not None and session.defers_token_drain:
+                # The native event orders publication before each routed read.
+                # The committing caller drains this token's writers later.
+                session.mark_token_boundary()
+            else:
+                join()
+                if gate is None:
+                    kick(result)
         return finish(result)
 
     if session.publication_pending:

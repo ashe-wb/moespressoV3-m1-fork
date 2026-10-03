@@ -777,3 +777,36 @@ def test_sync_join_falls_back_for_unsupported_executor_and_validates_before_subm
     finally:
         executor.pool.shutdown(wait=True)
     assert values == [1]
+
+
+def test_wait_prefix_releases_only_the_joined_calls() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+    import threading
+
+    from moespresso.runtime.pooled_load_batch import LoadBatch
+
+    gate = threading.Event()
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        batch = LoadBatch(executor)
+        batch.submit(lambda: None)
+        batch.submit(lambda: None)
+        batch.submit(lambda: gate.wait(5))
+        batch.wait_prefix(2)
+        assert batch.job_count() == 1
+        gate.set()
+        batch.wait()
+
+
+def test_wait_prefix_rejects_out_of_range_counts() -> None:
+    from concurrent.futures import ThreadPoolExecutor
+
+    import pytest
+
+    from moespresso.runtime.pooled_load_batch import LoadBatch
+
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        batch = LoadBatch(executor)
+        batch.submit(lambda: None)
+        with pytest.raises(ValueError, match="out of range"):
+            batch.wait_prefix(2)
+        batch.wait()
